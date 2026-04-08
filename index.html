@@ -1151,8 +1151,15 @@ let wordListVirtualState = null;
 let wordListScrollRafPending = false;
 let lastProgressStateSaveAt = 0;
 let lastWordListStateSaveAt = 0;
-let progressiveRenderToken = 0;
-let themeNormalizationSuspendCount = 0;
+let progressTableRenderToken = 0;
+let progressScrollSaveTimer = null;
+let wordListScrollSaveTimer = null;
+let wordListSettleTimer = null;
+let progressSettleTimer = null;
+let wordListRenderToken = 0;
+
+const RENDER_BATCH_SIZE = 170;
+const TABLE_RENDER_BATCH_SIZE = 60;
 
 const PROGRESS_VIEW_STATE_KEY = 'vocabProgressViewState_V1';
 const WORD_LIST_VIEW_STATE_KEY = 'vocabWordListViewState_V1';
@@ -1226,69 +1233,6 @@ function saveWordListViewState(nextState) {
   try {
     localStorage.setItem(WORD_LIST_VIEW_STATE_KEY, JSON.stringify(merged));
   } catch (e) {}
-}
-
-function pauseThemeNormalization() {
-  themeNormalizationSuspendCount++;
-}
-
-function resumeThemeNormalization(root) {
-  if (themeNormalizationSuspendCount > 0) themeNormalizationSuspendCount--;
-  if (themeNormalizationSuspendCount === 0 && root && document.body.classList.contains('theme-dark')) {
-    requestAnimationFrame(() => applyThemeToInlineStyles(root));
-  }
-}
-
-function appendHtmlInBatches(targetEl, items, renderItem, options = {}) {
-  if (!targetEl) return;
-  const total = items.length;
-  const token = options.token || 0;
-  const initialCount = Math.min(total, Math.max(1, options.initialCount || 40));
-  const chunkSize = Math.max(1, options.chunkSize || 80);
-  const deferThemeNormalize = !!options.deferThemeNormalize;
-  const normalizeRoot = options.normalizeRoot || targetEl;
-  const onInitial = typeof options.onInitial === 'function' ? options.onInitial : null;
-  const onComplete = typeof options.onComplete === 'function' ? options.onComplete : null;
-  let finished = false;
-
-  if (deferThemeNormalize) pauseThemeNormalization();
-
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    if (deferThemeNormalize) resumeThemeNormalization(normalizeRoot);
-    if (onComplete) onComplete();
-  };
-
-  let cursor = 0;
-  let initialHtml = '';
-  for (; cursor < initialCount; cursor++) {
-    initialHtml += renderItem(items[cursor], cursor);
-  }
-  targetEl.innerHTML = initialHtml;
-  if (onInitial) onInitial();
-
-  const flushChunk = () => {
-    if (token && token !== progressiveRenderToken) {
-      finish();
-      return;
-    }
-    if (cursor >= total) {
-      finish();
-      return;
-    }
-
-    const end = Math.min(total, cursor + chunkSize);
-    let html = '';
-    for (; cursor < end; cursor++) {
-      html += renderItem(items[cursor], cursor);
-    }
-    if (html) targetEl.insertAdjacentHTML('beforeend', html);
-    requestAnimationFrame(flushChunk);
-  };
-
-  if (cursor < total) requestAnimationFrame(flushChunk);
-  else finish();
 }
 
 function showToast(message) {
@@ -1589,13 +1533,10 @@ function applyThemeMode() {
   syncThemeControl(mode);
 
   // 切り替えの初動を優先して、重い正規化は次フレームで実行する
-  if (mode === 'dark') {
-    requestAnimationFrame(() => applyThemeToInlineStyles(document));
-  }
+  requestAnimationFrame(() => applyThemeToInlineStyles(document));
 
   if (!themeMutationObserver && typeof MutationObserver !== 'undefined') {
     themeMutationObserver = new MutationObserver((mutations) => {
-      if (themeNormalizationSuspendCount > 0) return;
       mutations.forEach(mutation => {
         if (mutation.type === 'attributes' && mutation.target && mutation.target.nodeType === 1) {
           applyThemeToInlineStyles(mutation.target);
@@ -1687,7 +1628,41 @@ function renderChapterList(movedId = null) {
   });
 }
 
+function createWordListItemElement(word, now, targetThreshold) {
+  const isMastered = (word.streak || 0) >= targetThreshold;
+  const rem = (word.nextReviewTime || 0) - now;
+  const timeText = rem > 0 ? '(復習まであと ' + getRemTime(rem) + ')' : '(復習可能)';
+  const remText = isMastered ? `<span class="time-display" data-next-time="${word.nextReviewTime}" data-format="list">${timeText}</span>` : '';
+
+  const li = document.createElement('li');
+  li.innerHTML = `
+    <div class="word-info">
+      <strong style="font-size:1.1em; color:#2c3e50;">${word.en}</strong> - ${word.ja}<br>
+      <small style="color:#7f8c8d;">${word.ex||''}</small><br>
+      ${isMastered ? `<span class="badge mastered">習熟済 ${remText}</span>` : `<span class="badge">習得度: ${word.streak||0}/${targetThreshold}</span>`}
+    </div>
+    <div class="word-actions">
+      <div>
+        <button class="small-btn reset" onclick="resetWordProgress('${word.id}')">🔄</button>
+        <button class="edit-btn" onclick="editWord('${word.id}')" style="margin:0;">･･･</button>
+      </div>
+      <button class="delete" onclick="deleteWord('${word.id}')">削除</button>
+    </div>
+  `;
+  return li;
+}
+
+function clearWordListVisibleItems(list, topSpacer, bottomSpacer) {
+  let node = topSpacer.nextSibling;
+  while (node && node !== bottomSpacer) {
+    const next = node.nextSibling;
+    list.removeChild(node);
+    node = next;
+  }
+}
+
 function renderWordList() {
+  wordListRenderToken++;
   const list = document.getElementById('word-list');
   if (!list) return;
 
@@ -1724,46 +1699,37 @@ function renderWordList() {
     return;
   }
 
+  wordListVirtualState = null;
+  if (wordListSettleTimer) {
+    clearTimeout(wordListSettleTimer);
+    wordListSettleTimer = null;
+  }
+
+  list.innerHTML = '';
   const now = Date.now();
   const targetThreshold = getCurrentMasteryThreshold();
-  const renderWordItemHtml = (w) => {
-    const isM = (w.streak || 0) >= targetThreshold;
-    const rem = (w.nextReviewTime || 0) - now;
-    const timeText = rem > 0 ? '(復習まであと ' + getRemTime(rem) + ')' : '(復習可能)';
-    const remText = isM ? `<span class="time-display" data-next-time="${w.nextReviewTime}" data-format="list">${timeText}</span>` : '';
-    return `<li>
-      <div class="word-info">
-        <strong style="font-size:1.1em; color:#2c3e50;">${w.en}</strong> - ${w.ja}<br>
-        <small style="color:#7f8c8d;">${w.ex||''}</small><br>
-        ${isM ? `<span class="badge mastered">習熟済 ${remText}</span>` : `<span class="badge">習得度: ${w.streak||0}/${targetThreshold}</span>`}
-      </div>
-      <div class="word-actions">
-        <div>
-          <button class="small-btn reset" onclick="resetWordProgress('${w.id}')">🔄</button>
-          <button class="edit-btn" onclick="editWord('${w.id}')" style="margin:0;">･･･</button>
-        </div>
-        <button class="delete" onclick="deleteWord('${w.id}')">削除</button>
-      </div>
-    </li>`;
+  const currentToken = wordListRenderToken;
+  let index = 0;
+  let restoredScroll = false;
+
+  const appendChunk = () => {
+    if (currentToken !== wordListRenderToken) return;
+    const end = Math.min(words.length, index + RENDER_BATCH_SIZE);
+    const fragment = document.createDocumentFragment();
+    for (; index < end; index++) {
+      fragment.appendChild(createWordListItemElement(words[index], now, targetThreshold));
+    }
+    list.appendChild(fragment);
+
+    if (!restoredScroll) {
+      list.scrollTop = savedScrollTop;
+      restoredScroll = true;
+    }
+
+    if (index < words.length) requestAnimationFrame(appendChunk);
   };
 
-  const estimatedItemHeight = 110;
-  const minItemsForSavedPos = Math.floor(savedScrollTop / estimatedItemHeight) + 18;
-  const initialCount = Math.min(words.length, Math.max(18, minItemsForSavedPos));
-  const token = ++progressiveRenderToken;
-
-  appendHtmlInBatches(list, words, renderWordItemHtml, {
-    token,
-    initialCount,
-    chunkSize: 40,
-    deferThemeNormalize: true,
-    normalizeRoot: list,
-    onInitial: () => {
-      list.scrollTop = savedScrollTop;
-    }
-  });
-
-  wordListVirtualState = null;
+  appendChunk();
 }
 
 function renderWordListVirtualWindow() {
@@ -1773,75 +1739,126 @@ function renderWordListVirtualWindow() {
   const now = Date.now();
   const targetThreshold = getCurrentMasteryThreshold();
   const { words, startIndex, endIndex, estimatedItemHeight } = wordListVirtualState;
-  const visibleWords = words.slice(startIndex, endIndex);
 
-  const cardHtml = visibleWords.map(w => {
-    const isM = (w.streak || 0) >= targetThreshold;
-    const rem = (w.nextReviewTime || 0) - now;
-    const timeText = rem > 0 ? '(復習まであと ' + getRemTime(rem) + ')' : '(復習可能)';
-    const remText = isM ? `<span class="time-display" data-next-time="${w.nextReviewTime}" data-format="list">${timeText}</span>` : '';
-    return `<li>
-      <div class="word-info">
-        <strong style="font-size:1.1em; color:#2c3e50;">${w.en}</strong> - ${w.ja}<br>
-        <small style="color:#7f8c8d;">${w.ex||''}</small><br>
-        ${isM ? `<span class="badge mastered">習熟済 ${remText}</span>` : `<span class="badge">習得度: ${w.streak||0}/${targetThreshold}</span>`}
-      </div>
-      <div class="word-actions">
-        <div>
-          <button class="small-btn reset" onclick="resetWordProgress('${w.id}')">🔄</button>
-          <button class="edit-btn" onclick="editWord('${w.id}')" style="margin:0;">･･･</button>
-        </div>
-        <button class="delete" onclick="deleteWord('${w.id}')">削除</button>
-      </div>
-    </li>`;
-  }).join('');
+  if (!wordListVirtualState.topSpacerEl || !wordListVirtualState.bottomSpacerEl || !wordListVirtualState.topSpacerEl.isConnected || !wordListVirtualState.bottomSpacerEl.isConnected) {
+    list.innerHTML = '';
+    const topSpacer = document.createElement('li');
+    topSpacer.style.margin = '0';
+    topSpacer.style.padding = '0';
+    topSpacer.style.border = 'none';
+    topSpacer.style.boxShadow = 'none';
+    topSpacer.style.background = 'transparent';
+
+    const bottomSpacer = document.createElement('li');
+    bottomSpacer.style.margin = '0';
+    bottomSpacer.style.padding = '0';
+    bottomSpacer.style.border = 'none';
+    bottomSpacer.style.boxShadow = 'none';
+    bottomSpacer.style.background = 'transparent';
+
+    list.appendChild(topSpacer);
+    list.appendChild(bottomSpacer);
+
+    wordListVirtualState.topSpacerEl = topSpacer;
+    wordListVirtualState.bottomSpacerEl = bottomSpacer;
+    wordListVirtualState.renderedStart = null;
+    wordListVirtualState.renderedEnd = null;
+  }
+
+  const topSpacer = wordListVirtualState.topSpacerEl;
+  const bottomSpacer = wordListVirtualState.bottomSpacerEl;
 
   const topH = startIndex * estimatedItemHeight;
   const bottomH = Math.max(0, (words.length - endIndex) * estimatedItemHeight);
+  topSpacer.style.height = `${topH}px`;
+  bottomSpacer.style.height = `${bottomH}px`;
 
-  list.innerHTML = `
-    <li style="height:${topH}px; margin:0; padding:0; border:none; box-shadow:none; background:transparent;"></li>
-    ${cardHtml}
-    <li style="height:${bottomH}px; margin:0; padding:0; border:none; box-shadow:none; background:transparent;"></li>
-  `;
+  if (wordListVirtualState.renderedStart === null || wordListVirtualState.renderedEnd === null) {
+    clearWordListVisibleItems(list, topSpacer, bottomSpacer);
+    for (let i = startIndex; i < endIndex; i++) {
+      list.insertBefore(createWordListItemElement(words[i], now, targetThreshold), bottomSpacer);
+    }
+    wordListVirtualState.renderedStart = startIndex;
+    wordListVirtualState.renderedEnd = endIndex;
+    return;
+  }
+
+  const renderedStart = wordListVirtualState.renderedStart;
+  const renderedEnd = wordListVirtualState.renderedEnd;
+  const largeJump = Math.abs(startIndex - renderedStart) > wordListVirtualState.windowSize;
+
+  if (largeJump) {
+    clearWordListVisibleItems(list, topSpacer, bottomSpacer);
+    for (let i = startIndex; i < endIndex; i++) {
+      list.insertBefore(createWordListItemElement(words[i], now, targetThreshold), bottomSpacer);
+    }
+    wordListVirtualState.renderedStart = startIndex;
+    wordListVirtualState.renderedEnd = endIndex;
+    return;
+  }
+
+  let currentStart = renderedStart;
+  let currentEnd = renderedEnd;
+
+  while (currentStart > startIndex) {
+    currentStart--;
+    list.insertBefore(createWordListItemElement(words[currentStart], now, targetThreshold), topSpacer.nextSibling);
+  }
+
+  while (currentEnd < endIndex) {
+    list.insertBefore(createWordListItemElement(words[currentEnd], now, targetThreshold), bottomSpacer);
+    currentEnd++;
+  }
+
+  while (currentStart < startIndex) {
+    const firstVisible = topSpacer.nextSibling;
+    if (!firstVisible || firstVisible === bottomSpacer) break;
+    list.removeChild(firstVisible);
+    currentStart++;
+  }
+
+  while (currentEnd > endIndex) {
+    const lastVisible = bottomSpacer.previousSibling;
+    if (!lastVisible || lastVisible === topSpacer) break;
+    list.removeChild(lastVisible);
+    currentEnd--;
+  }
+
+  wordListVirtualState.renderedStart = currentStart;
+  wordListVirtualState.renderedEnd = currentEnd;
 }
 
 function handleWordListVirtualScroll() {
   const list = document.getElementById('word-list');
   if (!list) return;
 
-  const fEl = document.getElementById('filter-chapter-select');
-  const f = fEl ? fEl.value : 'all';
-  const stateKey = `${appData.currentBookId || 'no-book'}|${f}`;
-  const nowTs = Date.now();
-  if (nowTs - lastWordListStateSaveAt > 180) {
+  if (wordListVirtualState) {
+    if (wordListScrollSaveTimer) clearTimeout(wordListScrollSaveTimer);
+    wordListScrollSaveTimer = setTimeout(() => {
+      saveWordListViewState({
+        lastKey: wordListVirtualState.stateKey,
+        scrollTop: list.scrollTop,
+        filterChapterId: document.getElementById('filter-chapter-select') ? document.getElementById('filter-chapter-select').value : 'all'
+      });
+      lastWordListStateSaveAt = Date.now();
+      wordListScrollSaveTimer = null;
+    }, 220);
+    return;
+  }
+
+  if (wordListScrollSaveTimer) clearTimeout(wordListScrollSaveTimer);
+  wordListScrollSaveTimer = setTimeout(() => {
+    const fEl = document.getElementById('filter-chapter-select');
+    const f = fEl ? fEl.value : 'all';
+    const stateKey = `${appData.currentBookId || 'no-book'}|${f}`;
     saveWordListViewState({
       lastKey: stateKey,
       scrollTop: list.scrollTop,
       filterChapterId: f
     });
-    lastWordListStateSaveAt = nowTs;
-  }
-
-  if (!wordListVirtualState) return;
-  if (wordListScrollRafPending) return;
-
-  wordListScrollRafPending = true;
-  requestAnimationFrame(() => {
-    wordListScrollRafPending = false;
-    if (!wordListVirtualState) return;
-
-    const { words, estimatedItemHeight, preloadBuffer, windowSize } = wordListVirtualState;
-    const firstVisible = Math.max(0, Math.floor(list.scrollTop / estimatedItemHeight));
-    const nextStart = Math.max(0, firstVisible - preloadBuffer);
-    const nextEnd = Math.min(words.length, Math.max(nextStart + windowSize, firstVisible + preloadBuffer));
-
-    if (nextStart !== wordListVirtualState.startIndex || nextEnd !== wordListVirtualState.endIndex) {
-      wordListVirtualState.startIndex = nextStart;
-      wordListVirtualState.endIndex = nextEnd;
-      renderWordListVirtualWindow();
-    }
-  });
+    lastWordListStateSaveAt = Date.now();
+    wordListScrollSaveTimer = null;
+  }, 220);
 }
 
 function addChapter() {
@@ -2046,9 +2063,6 @@ function switchTab(tab, btnElement) {
     triggerVibration(20);
   }
 
-  const currentPanel = document.querySelector('.panel.active');
-  persistPanelScrollState(currentPanel);
-
   const accBtn = document.querySelector('.app-header .account-btn');
   if (accBtn) {
     accBtn.style.opacity = '1';
@@ -2068,6 +2082,7 @@ function switchTab(tab, btnElement) {
     backBtn.style.pointerEvents = 'auto';
   }
 
+  const currentPanel = document.querySelector('.panel.active');
   const nextPanel = document.getElementById(`${tab}-panel`);
   
   if(currentPanel && currentPanel !== nextPanel) {
@@ -2209,6 +2224,7 @@ function toggleMask(el) {
 }
 
 function renderProgressView() {
+  progressTableRenderToken++;
   const config = getProgressViewConfig();
   const { chapterId: chId, displayMode, sortOrder, layoutMode, weakFilter, searchQuery } = config;
 
@@ -2369,86 +2385,67 @@ function renderProgressView() {
     </tr>`;
   };
 
-  // 表形式はスクロール中の差し替えを避け、初回にまとめて描画して滑らかさを優先
   if (layoutMode === 'table') {
     const now = Date.now();
+    const currentToken = progressTableRenderToken;
     container.innerHTML = `<div style="overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); background: var(--bg-surface);"><table style="width: 100%; border-collapse: collapse; table-layout: fixed;"><colgroup><col style="width:25%;"><col style="width:25%;"><col style="width:25%;"><col style="width:25%;"></colgroup><thead><tr style="background: var(--bg-muted);"><th style="padding:12px; text-align:left; border-bottom:2px solid var(--border); white-space:nowrap;">英単語</th><th style="padding:12px; text-align:left; border-bottom:2px solid var(--border);">日本語訳</th><th style="padding:12px; text-align:left; border-bottom:2px solid var(--border);">例文</th><th style="padding:12px; text-align:left; border-bottom:2px solid var(--border);">例文訳</th></tr></thead><tbody id="progress-table-body"></tbody></table></div>`;
 
     const tbody = document.getElementById('progress-table-body');
-    const estimatedRowHeight = 72;
-    const minRowsForSavedPos = Math.floor(savedScrollTop / estimatedRowHeight) + 40;
-    const initialCount = Math.min(displayWords.length, Math.max(40, minRowsForSavedPos));
-    const token = ++progressiveRenderToken;
+    if (!tbody) return;
 
-    appendHtmlInBatches(tbody, displayWords, (w) => createTableRowHtml(w, now), {
-      token,
-      initialCount,
-      chunkSize: 80,
-      deferThemeNormalize: true,
-      normalizeRoot: container,
-      onInitial: () => {
-        container.scrollTop = savedScrollTop;
+    let index = 0;
+    let restoredScroll = false;
+    const appendChunk = () => {
+      if (currentToken !== progressTableRenderToken) return;
+      const end = Math.min(displayWords.length, index + TABLE_RENDER_BATCH_SIZE);
+      let html = '';
+      for (; index < end; index++) {
+        html += createTableRowHtml(displayWords[index], now);
       }
-    });
+      if (html) tbody.insertAdjacentHTML('beforeend', html);
 
+      if (!restoredScroll) {
+        container.scrollTop = savedScrollTop;
+        restoredScroll = true;
+      }
+
+      if (index < displayWords.length) requestAnimationFrame(appendChunk);
+    };
+
+    appendChunk();
     progressVirtualState = null;
     return;
   }
-
-  // カード形式も同様に、スクロール中の差し替えを避けるためまとめて描画
-  if (layoutMode === 'list') {
-    const now = Date.now();
-    const estimatedCardHeight = 210;
-    const minCardsForSavedPos = Math.floor(savedScrollTop / estimatedCardHeight) + 14;
-    const initialCount = Math.min(displayWords.length, Math.max(14, minCardsForSavedPos));
-    const token = ++progressiveRenderToken;
-
-    appendHtmlInBatches(container, displayWords, (w) => createListCardHtml(w, now), {
-      token,
-      initialCount,
-      chunkSize: 28,
-      deferThemeNormalize: true,
-      normalizeRoot: container,
-      onInitial: () => {
-        container.scrollTop = savedScrollTop;
-      }
-    });
-
-    progressVirtualState = null;
-    return;
+  if (progressSettleTimer) {
+    clearTimeout(progressSettleTimer);
+    progressSettleTimer = null;
   }
 
-  const estimatedItemHeight = layoutMode === 'table' ? 72 : 210;
-  const preloadBuffer = layoutMode === 'table' ? 40 : 10;
-  const baseWindow = layoutMode === 'table' ? 110 : 20;
-  const updateStep = layoutMode === 'table' ? 4 : 1;
-  const firstVisibleIndex = Math.max(0, Math.floor(savedScrollTop / estimatedItemHeight));
-  const initialAnchor = Math.floor(firstVisibleIndex / updateStep) * updateStep;
-  const initialStart = Math.max(0, initialAnchor - preloadBuffer);
-  const initialEnd = Math.min(displayWords.length, Math.max(initialStart + baseWindow, firstVisibleIndex + preloadBuffer));
+  const currentToken = progressTableRenderToken;
+  container.innerHTML = '';
+  const now = Date.now();
+  let index = 0;
+  let restoredScroll = false;
 
-  progressVirtualState = {
-    words: displayWords,
-    layoutMode,
-    chapterMap,
-    wordIndexMap,
-    targetThreshold,
-    estimatedItemHeight,
-    preloadBuffer,
-    windowSize: baseWindow,
-    updateStep,
-    startIndex: initialStart,
-    endIndex: initialEnd,
-    config,
-    viewKey,
-    renderListCard: createListCardHtml,
-    renderTableRow: createTableRowHtml
+  const appendListChunk = () => {
+    if (currentToken !== progressTableRenderToken) return;
+    const end = Math.min(displayWords.length, index + RENDER_BATCH_SIZE);
+    let html = '';
+    for (; index < end; index++) {
+      html += createListCardHtml(displayWords[index], now);
+    }
+    if (html) container.insertAdjacentHTML('beforeend', html);
+
+    if (!restoredScroll) {
+      container.scrollTop = savedScrollTop;
+      restoredScroll = true;
+    }
+
+    if (index < displayWords.length) requestAnimationFrame(appendListChunk);
   };
 
-  container.innerHTML = '<div id="progress-top-spacer"></div><div id="progress-items-host"></div><div id="progress-bottom-spacer"></div>';
-
-  renderProgressVirtualWindow();
-  container.scrollTop = savedScrollTop;
+  appendListChunk();
+  progressVirtualState = null;
 }
 
 function renderProgressVirtualWindow() {
@@ -2456,31 +2453,81 @@ function renderProgressVirtualWindow() {
   if (!container || !progressVirtualState) return;
 
   const now = Date.now();
-  const { words, startIndex, endIndex, estimatedItemHeight, layoutMode } = progressVirtualState;
-  const visibleWords = words.slice(startIndex, endIndex);
+  const { words, startIndex, endIndex, estimatedItemHeight } = progressVirtualState;
 
-  if (layoutMode === 'table') {
-    const tbody = document.getElementById('progress-table-body');
-    if (!tbody) return;
-    const topH = startIndex * estimatedItemHeight;
-    const bottomH = Math.max(0, (words.length - endIndex) * estimatedItemHeight);
-    const tableRows = visibleWords.map(w => progressVirtualState.renderTableRow(w, now)).join('');
-    tbody.innerHTML = `
-      <tr><td colspan="4" style="padding:0; border:none; height:${topH}px;"></td></tr>
-      ${tableRows}
-      <tr><td colspan="4" style="padding:0; border:none; height:${bottomH}px;"></td></tr>
-    `;
-    return;
-  }
-
-  const topSpacer = document.getElementById('progress-top-spacer');
-  const bottomSpacer = document.getElementById('progress-bottom-spacer');
-  const host = document.getElementById('progress-items-host');
+  const topSpacer = progressVirtualState.topSpacerEl || document.getElementById('progress-top-spacer');
+  const bottomSpacer = progressVirtualState.bottomSpacerEl || document.getElementById('progress-bottom-spacer');
+  const host = progressVirtualState.hostEl || document.getElementById('progress-items-host');
   if (!topSpacer || !bottomSpacer || !host) return;
+
+  progressVirtualState.topSpacerEl = topSpacer;
+  progressVirtualState.bottomSpacerEl = bottomSpacer;
+  progressVirtualState.hostEl = host;
 
   topSpacer.style.height = `${startIndex * estimatedItemHeight}px`;
   bottomSpacer.style.height = `${Math.max(0, (words.length - endIndex) * estimatedItemHeight)}px`;
-  host.innerHTML = visibleWords.map(w => progressVirtualState.renderListCard(w, now)).join('');
+
+  const createCard = (word) => {
+    const template = document.createElement('template');
+    template.innerHTML = progressVirtualState.renderListCard(word, now).trim();
+    return template.content.firstElementChild;
+  };
+
+  if (progressVirtualState.renderedStart === null || progressVirtualState.renderedEnd === null) {
+    host.innerHTML = '';
+    for (let i = startIndex; i < endIndex; i++) {
+      const card = createCard(words[i]);
+      if (card) host.appendChild(card);
+    }
+    progressVirtualState.renderedStart = startIndex;
+    progressVirtualState.renderedEnd = endIndex;
+    return;
+  }
+
+  const renderedStart = progressVirtualState.renderedStart;
+  const renderedEnd = progressVirtualState.renderedEnd;
+  const largeJump = Math.abs(startIndex - renderedStart) > progressVirtualState.windowSize;
+
+  if (largeJump) {
+    host.innerHTML = '';
+    for (let i = startIndex; i < endIndex; i++) {
+      const card = createCard(words[i]);
+      if (card) host.appendChild(card);
+    }
+    progressVirtualState.renderedStart = startIndex;
+    progressVirtualState.renderedEnd = endIndex;
+    return;
+  }
+
+  let currentStart = renderedStart;
+  let currentEnd = renderedEnd;
+
+  while (currentStart > startIndex) {
+    currentStart--;
+    const card = createCard(words[currentStart]);
+    if (card) host.insertBefore(card, host.firstChild);
+  }
+
+  while (currentEnd < endIndex) {
+    const card = createCard(words[currentEnd]);
+    if (card) host.appendChild(card);
+    currentEnd++;
+  }
+
+  while (currentStart < startIndex) {
+    if (!host.firstElementChild) break;
+    host.removeChild(host.firstElementChild);
+    currentStart++;
+  }
+
+  while (currentEnd > endIndex) {
+    if (!host.lastElementChild) break;
+    host.removeChild(host.lastElementChild);
+    currentEnd--;
+  }
+
+  progressVirtualState.renderedStart = currentStart;
+  progressVirtualState.renderedEnd = currentEnd;
 }
 
 function handleProgressVirtualScroll() {
@@ -2490,71 +2537,12 @@ function handleProgressVirtualScroll() {
   const activeConfig = progressVirtualState ? progressVirtualState.config : getProgressViewConfig();
   const activeKey = progressVirtualState ? progressVirtualState.viewKey : JSON.stringify(activeConfig);
   const activeScrollKey = getProgressScrollKey(activeConfig);
-  const nowTs = Date.now();
-  if (nowTs - lastProgressStateSaveAt > 180) {
+  if (progressScrollSaveTimer) clearTimeout(progressScrollSaveTimer);
+  progressScrollSaveTimer = setTimeout(() => {
     saveProgressViewState({ ...activeConfig, lastViewKey: activeKey, lastScrollKey: activeScrollKey, scrollTop: container.scrollTop });
-    lastProgressStateSaveAt = nowTs;
-  }
-
-  if (!progressVirtualState) return;
-
-  if (progressScrollRafPending) return;
-  progressScrollRafPending = true;
-  requestAnimationFrame(() => {
-    progressScrollRafPending = false;
-    if (!progressVirtualState) return;
-
-    const total = progressVirtualState.words.length;
-    const estimated = progressVirtualState.estimatedItemHeight;
-    const preload = progressVirtualState.preloadBuffer;
-    const base = progressVirtualState.windowSize;
-    const step = progressVirtualState.updateStep || 1;
-    const firstVisible = Math.max(0, Math.floor(container.scrollTop / estimated));
-    const anchoredVisible = Math.floor(firstVisible / step) * step;
-
-    const nextStart = Math.max(0, anchoredVisible - preload);
-    const nextEnd = Math.min(total, Math.max(nextStart + base, anchoredVisible + preload));
-
-    if (nextStart !== progressVirtualState.startIndex || nextEnd !== progressVirtualState.endIndex) {
-      progressVirtualState.startIndex = nextStart;
-      progressVirtualState.endIndex = nextEnd;
-      renderProgressVirtualWindow();
-    }
-  });
-}
-
-function persistPanelScrollState(panelEl) {
-  if (!panelEl || !panelEl.id) return;
-
-  if (panelEl.id === 'manage-panel') {
-    const list = document.getElementById('word-list');
-    if (!list) return;
-    const fEl = document.getElementById('filter-chapter-select');
-    const f = fEl ? fEl.value : 'all';
-    const stateKey = `${appData.currentBookId || 'no-book'}|${f}`;
-    saveWordListViewState({
-      lastKey: stateKey,
-      filterChapterId: f,
-      scrollTop: list.scrollTop
-    });
-    lastWordListStateSaveAt = Date.now();
-    return;
-  }
-
-  if (panelEl.id === 'progress-panel') {
-    const container = document.getElementById('progress-view-container');
-    if (!container) return;
-    const config = getProgressViewConfig();
-    const viewKey = JSON.stringify(config);
-    const scrollKey = getProgressScrollKey(config);
-    saveProgressViewState({
-      ...config,
-      lastViewKey: viewKey,
-      lastScrollKey: scrollKey,
-      scrollTop: container.scrollTop
-    });
     lastProgressStateSaveAt = Date.now();
-  }
+    progressScrollSaveTimer = null;
+  }, 220);
 }
 
 // ▼ 2. 通常クイズ開始（フラッシュバグ防止版）
@@ -3000,6 +2988,7 @@ function getAutoModeSettings(streak, targetThreshold) {
 
 const observer = (typeof MutationObserver !== 'undefined')
   ? new MutationObserver(() => {
+      if (progressVirtualState && progressVirtualState.layoutMode === 'list') return;
       if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
     })
   : null;
@@ -3036,8 +3025,11 @@ document.addEventListener('click', function(event) {
 // ▲▲ ここまで ▲▲
 
 
-// 進捗画面のスクロール監視
+// 進捗画面の変化を監視開始
 const progressContainer = document.getElementById('progress-view-container');
+if (progressContainer && observer) {
+  observer.observe(progressContainer, { childList: true, subtree: true });
+}
 if (progressContainer) {
   progressContainer.addEventListener('scroll', handleProgressVirtualScroll, { passive: true });
 }
@@ -3051,4 +3043,3 @@ if (wordListContainer) {
 </script>
 </body>
 </html>
-
