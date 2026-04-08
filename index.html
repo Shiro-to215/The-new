@@ -1157,8 +1157,9 @@ let wordListScrollSaveTimer = null;
 let wordListSettleTimer = null;
 let progressSettleTimer = null;
 let wordListRenderToken = 0;
+let hasNormalizedInlineStyles = false;
 
-const RENDER_BATCH_SIZE = 170;
+const RENDER_BATCH_SIZE = 100;
 const TABLE_RENDER_BATCH_SIZE = 60;
 
 const PROGRESS_VIEW_STATE_KEY = 'vocabProgressViewState_V1';
@@ -1532,15 +1533,17 @@ function applyThemeMode() {
   document.body.classList.toggle('theme-light', mode !== 'dark');
   syncThemeControl(mode);
 
-  // 切り替えの初動を優先して、重い正規化は次フレームで実行する
-  requestAnimationFrame(() => applyThemeToInlineStyles(document));
+  // 初回のみ全体を正規化。以降は切替アニメーションの滑らかさを優先。
+  if (!hasNormalizedInlineStyles) {
+    requestAnimationFrame(() => {
+      applyThemeToInlineStyles(document);
+      hasNormalizedInlineStyles = true;
+    });
+  }
 
   if (!themeMutationObserver && typeof MutationObserver !== 'undefined') {
     themeMutationObserver = new MutationObserver((mutations) => {
       mutations.forEach(mutation => {
-        if (mutation.type === 'attributes' && mutation.target && mutation.target.nodeType === 1) {
-          applyThemeToInlineStyles(mutation.target);
-        }
         mutation.addedNodes.forEach(node => {
           if (node && node.nodeType === 1) applyThemeToInlineStyles(node);
         });
@@ -1548,9 +1551,7 @@ function applyThemeMode() {
     });
     themeMutationObserver.observe(document.body, {
       childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['style']
+      subtree: true
     });
   }
 }
@@ -2114,14 +2115,22 @@ function switchTab(tab, btnElement) {
   
   // ▼ 変更：アニメーションが終わった直後に「なめらかスクロール」を発動させる
   setTimeout(() => {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    window.scrollTo({ top: 0, behavior: 'auto' });
   }, 150);
 
   setTimeout(() => {
-    if(tab === 'manage') renderWordList();
+    if(tab === 'manage') {
+      const list = document.getElementById('word-list');
+      if (list && list.childElementCount === 0) renderWordList();
+    }
     if(tab === 'progress') {
-      applySavedProgressFilters();
-      renderProgressView();
+      const container = document.getElementById('progress-view-container');
+      if (container && container.childElementCount === 0) {
+        applySavedProgressFilters();
+        renderProgressView();
+      } else if (typeof updateTimeDisplays === 'function') {
+        updateTimeDisplays();
+      }
     }
   }, 200);
 }
@@ -2410,6 +2419,7 @@ function renderProgressView() {
       }
 
       if (index < displayWords.length) requestAnimationFrame(appendChunk);
+      else if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
     };
 
     appendChunk();
@@ -2442,6 +2452,7 @@ function renderProgressView() {
     }
 
     if (index < displayWords.length) requestAnimationFrame(appendListChunk);
+    else if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
   };
 
   appendListChunk();
@@ -2721,10 +2732,8 @@ function nextQuestion() {
       const qCard = document.querySelector('.question-card');
       if (qCard) {
           qCard.style.cursor = 'pointer';
-          qCard.setAttribute('onclick', ''); // スマホに「タップできるよ」と認識させる
-    
-          // onclick ではなく、スマホで無視されにくい addEventListener を使う
-          qCard.addEventListener('click', function() {
+          // 問題が進むたびにリスナーが積み上がらないように、毎回上書きする
+          qCard.onclick = function() {
               let textToRead = "";
 
               if (curQ && curQ.ex && curQ.ex.trim() !== "") {
@@ -2739,7 +2748,7 @@ function nextQuestion() {
                   let cleanText = textToRead.replace(/<[^>]*>?/gm, '');
                   playVoice(cleanText);
               }
-          });
+                };
       }
       // ▲▲ ここまで ▲▲
   } catch(e) { console.log("音声再生エラー:", e); }
@@ -2986,13 +2995,6 @@ function getAutoModeSettings(streak, targetThreshold) {
 }
 // ▲▲ ここまで ▲▲
 
-const observer = (typeof MutationObserver !== 'undefined')
-  ? new MutationObserver(() => {
-      if (progressVirtualState && progressVirtualState.layoutMode === 'list') return;
-      if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
-    })
-  : null;
-
 // ▼▼ 最終形態Ver4：クイズ画面中だけ正確に鳴らす ▼▼
 document.addEventListener('click', function(event) {
     // ① ボタンなどを押した時はスルー
@@ -3027,9 +3029,6 @@ document.addEventListener('click', function(event) {
 
 // 進捗画面の変化を監視開始
 const progressContainer = document.getElementById('progress-view-container');
-if (progressContainer && observer) {
-  observer.observe(progressContainer, { childList: true, subtree: true });
-}
 if (progressContainer) {
   progressContainer.addEventListener('scroll', handleProgressVirtualScroll, { passive: true });
 }
