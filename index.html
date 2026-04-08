@@ -1149,6 +1149,8 @@ let progressVirtualState = null;
 let progressScrollRafPending = false;
 let wordListVirtualState = null;
 let wordListScrollRafPending = false;
+let progressChunkState = null;
+let wordListChunkState = null;
 let lastProgressStateSaveAt = 0;
 let lastWordListStateSaveAt = 0;
 let progressTableRenderToken = 0;
@@ -1159,7 +1161,8 @@ let progressSettleTimer = null;
 let wordListRenderToken = 0;
 let hasNormalizedInlineStyles = false;
 
-const RENDER_BATCH_SIZE = 100;
+const RENDER_BATCH_SIZE = 50;
+const INITIAL_RENDER_BATCH_SIZE = 100;
 const TABLE_RENDER_BATCH_SIZE = 60;
 
 const PROGRESS_VIEW_STATE_KEY = 'vocabProgressViewState_V1';
@@ -1662,6 +1665,25 @@ function clearWordListVisibleItems(list, topSpacer, bottomSpacer) {
   }
 }
 
+function appendWordListChunk(count = RENDER_BATCH_SIZE) {
+  if (!wordListChunkState) return;
+  const { list, words, now, targetThreshold, token, renderedIds } = wordListChunkState;
+  if (!list || token !== wordListRenderToken) return;
+
+  const end = Math.min(words.length, wordListChunkState.nextIndex + count);
+  if (wordListChunkState.nextIndex >= end) return;
+
+  const fragment = document.createDocumentFragment();
+  for (let i = wordListChunkState.nextIndex; i < end; i++) {
+    const word = words[i];
+    if (!word || !word.id || renderedIds.has(word.id)) continue;
+    renderedIds.add(word.id);
+    fragment.appendChild(createWordListItemElement(word, now, targetThreshold));
+  }
+  wordListChunkState.nextIndex = end;
+  if (fragment.childNodes.length > 0) list.appendChild(fragment);
+}
+
 function renderWordList() {
   wordListRenderToken++;
   const list = document.getElementById('word-list');
@@ -1695,12 +1717,14 @@ function renderWordList() {
 
   if (words.length === 0) {
     wordListVirtualState = null;
+    wordListChunkState = null;
     list.innerHTML = '<li style="background: transparent; border: none; box-shadow: none; margin: 0; padding: 10px; color: var(--text-secondary);">単語がありません</li>';
     list.scrollTop = 0;
     return;
   }
 
   wordListVirtualState = null;
+  wordListChunkState = null;
   if (wordListSettleTimer) {
     clearTimeout(wordListSettleTimer);
     wordListSettleTimer = null;
@@ -1710,27 +1734,24 @@ function renderWordList() {
   const now = Date.now();
   const targetThreshold = getCurrentMasteryThreshold();
   const currentToken = wordListRenderToken;
-  let index = 0;
-  let restoredScroll = false;
-
-  const appendChunk = () => {
-    if (currentToken !== wordListRenderToken) return;
-    const end = Math.min(words.length, index + RENDER_BATCH_SIZE);
-    const fragment = document.createDocumentFragment();
-    for (; index < end; index++) {
-      fragment.appendChild(createWordListItemElement(words[index], now, targetThreshold));
-    }
-    list.appendChild(fragment);
-
-    if (!restoredScroll) {
-      list.scrollTop = savedScrollTop;
-      restoredScroll = true;
-    }
-
-    if (index < words.length) requestAnimationFrame(appendChunk);
+  wordListChunkState = {
+    list,
+    words,
+    now,
+    targetThreshold,
+    token: currentToken,
+    nextIndex: 0,
+    renderedIds: new Set()
   };
 
-  appendChunk();
+  appendWordListChunk(INITIAL_RENDER_BATCH_SIZE);
+  list.scrollTop = savedScrollTop;
+
+  let fillGuard = 0;
+  while (wordListChunkState && wordListChunkState.nextIndex < words.length && list.scrollTop + list.clientHeight >= list.scrollHeight - 200 && fillGuard < 6) {
+    appendWordListChunk(RENDER_BATCH_SIZE);
+    fillGuard++;
+  }
 }
 
 function renderWordListVirtualWindow() {
@@ -1769,10 +1790,14 @@ function renderWordListVirtualWindow() {
   const topSpacer = wordListVirtualState.topSpacerEl;
   const bottomSpacer = wordListVirtualState.bottomSpacerEl;
 
-  const topH = startIndex * estimatedItemHeight;
-  const bottomH = Math.max(0, (words.length - endIndex) * estimatedItemHeight);
-  topSpacer.style.height = `${topH}px`;
-  bottomSpacer.style.height = `${bottomH}px`;
+  const applyWordListSpacerHeights = () => {
+    const topH = wordListVirtualState.startIndex * wordListVirtualState.estimatedItemHeight;
+    const bottomH = Math.max(0, (words.length - wordListVirtualState.endIndex) * wordListVirtualState.estimatedItemHeight);
+    topSpacer.style.height = `${topH}px`;
+    bottomSpacer.style.height = `${bottomH}px`;
+  };
+
+  applyWordListSpacerHeights();
 
   if (wordListVirtualState.renderedStart === null || wordListVirtualState.renderedEnd === null) {
     clearWordListVisibleItems(list, topSpacer, bottomSpacer);
@@ -1827,39 +1852,139 @@ function renderWordListVirtualWindow() {
 
   wordListVirtualState.renderedStart = currentStart;
   wordListVirtualState.renderedEnd = currentEnd;
+
+  // Visible rows are measured to continuously refine spacer estimation and reduce stop-time offset.
+  let measuredTotal = 0;
+  let measuredCount = 0;
+  let el = topSpacer.nextSibling;
+  while (el && el !== bottomSpacer) {
+    measuredTotal += el.offsetHeight;
+    measuredCount++;
+    el = el.nextSibling;
+  }
+  if (measuredCount > 0 && (Date.now() - (wordListVirtualState.lastScrollAt || 0)) > 120) {
+    const measuredAverage = measuredTotal / measuredCount;
+    const prev = wordListVirtualState.estimatedItemHeight;
+    const next = prev * 0.8 + measuredAverage * 0.2;
+    if (Math.abs(next - prev) >= 0.5) {
+      wordListVirtualState.estimatedItemHeight = next;
+      applyWordListSpacerHeights();
+    }
+  }
+}
+
+function getWordListFirstVisibleIndex(list, state) {
+  const topSpacer = state.topSpacerEl;
+  const bottomSpacer = state.bottomSpacerEl;
+  if (!topSpacer || !bottomSpacer || state.renderedStart === null) {
+    return Math.max(0, Math.floor(list.scrollTop / state.estimatedItemHeight));
+  }
+
+  const viewTop = list.scrollTop;
+  let idx = 0;
+  let node = topSpacer.nextSibling;
+  while (node && node !== bottomSpacer) {
+    if ((node.offsetTop + node.offsetHeight) > viewTop) {
+      return state.renderedStart + idx;
+    }
+    idx++;
+    node = node.nextSibling;
+  }
+
+  return Math.max(0, Math.floor(list.scrollTop / state.estimatedItemHeight));
 }
 
 function handleWordListVirtualScroll() {
   const list = document.getElementById('word-list');
   if (!list) return;
 
-  if (wordListVirtualState) {
-    if (wordListScrollSaveTimer) clearTimeout(wordListScrollSaveTimer);
-    wordListScrollSaveTimer = setTimeout(() => {
-      saveWordListViewState({
-        lastKey: wordListVirtualState.stateKey,
-        scrollTop: list.scrollTop,
-        filterChapterId: document.getElementById('filter-chapter-select') ? document.getElementById('filter-chapter-select').value : 'all'
-      });
-      lastWordListStateSaveAt = Date.now();
-      wordListScrollSaveTimer = null;
-    }, 220);
-    return;
-  }
-
   if (wordListScrollSaveTimer) clearTimeout(wordListScrollSaveTimer);
   wordListScrollSaveTimer = setTimeout(() => {
-    const fEl = document.getElementById('filter-chapter-select');
-    const f = fEl ? fEl.value : 'all';
-    const stateKey = `${appData.currentBookId || 'no-book'}|${f}`;
+    const stateKey = wordListVirtualState ? wordListVirtualState.stateKey : `${appData.currentBookId || 'no-book'}|${(document.getElementById('filter-chapter-select') ? document.getElementById('filter-chapter-select').value : 'all')}`;
     saveWordListViewState({
       lastKey: stateKey,
       scrollTop: list.scrollTop,
-      filterChapterId: f
+      filterChapterId: document.getElementById('filter-chapter-select') ? document.getElementById('filter-chapter-select').value : 'all'
     });
     lastWordListStateSaveAt = Date.now();
     wordListScrollSaveTimer = null;
   }, 220);
+
+  if (wordListChunkState) {
+    if (list.scrollTop + list.clientHeight >= list.scrollHeight - 300) {
+      appendWordListChunk(RENDER_BATCH_SIZE);
+    }
+    return;
+  }
+
+  if (!wordListVirtualState) return;
+  wordListVirtualState.lastScrollAt = Date.now();
+  if (wordListScrollRafPending) return;
+
+  wordListScrollRafPending = true;
+  requestAnimationFrame(() => {
+    wordListScrollRafPending = false;
+    if (!wordListVirtualState) return;
+
+    const { words, preloadBuffer, windowSize } = wordListVirtualState;
+    const total = words.length;
+    if (total === 0) return;
+
+    const nowTs = performance.now();
+    const prevTop = typeof wordListVirtualState.lastScrollTop === 'number' ? wordListVirtualState.lastScrollTop : list.scrollTop;
+    const prevTime = typeof wordListVirtualState.lastScrollTime === 'number' ? wordListVirtualState.lastScrollTime : nowTs;
+    const dt = Math.max(1, nowTs - prevTime);
+    const velocity = Math.abs(list.scrollTop - prevTop) / dt;
+    wordListVirtualState.lastScrollTop = list.scrollTop;
+    wordListVirtualState.lastScrollTime = nowTs;
+
+    const maxVisible = total - 1;
+    const roughVisible = Math.max(0, Math.min(maxVisible, Math.floor(list.scrollTop / wordListVirtualState.estimatedItemHeight)));
+    const baseStep = Math.max(1, wordListVirtualState.updateStep || 1);
+    let mode = wordListVirtualState.scrollStepMode || 1;
+    if (mode === 1 && velocity > 2.0) mode = 2;
+    else if (mode === 2 && velocity > 2.8) mode = 3;
+    else if (mode === 2 && velocity < 1.2) mode = 1;
+    else if (mode === 3 && velocity < 2.0) mode = 2;
+    wordListVirtualState.scrollStepMode = mode;
+
+    const dynamicStep = mode === 3 ? baseStep * 3 : (mode === 2 ? baseStep * 2 : 1);
+    const firstVisible = mode === 1 ? roughVisible : Math.floor(roughVisible / dynamicStep) * dynamicStep;
+    const maxStart = Math.max(0, total - windowSize);
+    const nextStart = Math.max(0, Math.min(maxStart, firstVisible - preloadBuffer));
+    const nextEnd = Math.min(total, Math.max(nextStart + windowSize, firstVisible + preloadBuffer));
+
+    if (dynamicStep > 1 && Math.abs(nextStart - wordListVirtualState.startIndex) < dynamicStep && Math.abs(nextEnd - wordListVirtualState.endIndex) < dynamicStep) {
+      return;
+    }
+
+    if (nextStart !== wordListVirtualState.startIndex || nextEnd !== wordListVirtualState.endIndex) {
+      wordListVirtualState.startIndex = nextStart;
+      wordListVirtualState.endIndex = nextEnd;
+      renderWordListVirtualWindow();
+    }
+  });
+
+  if (wordListSettleTimer) clearTimeout(wordListSettleTimer);
+  wordListSettleTimer = setTimeout(() => {
+    if (!wordListVirtualState) return;
+    wordListVirtualState.lastScrollAt = 0;
+    wordListVirtualState.scrollStepMode = 1;
+    const total = wordListVirtualState.words.length;
+    if (total === 0) return;
+    const maxVisible = total - 1;
+    const roughVisible = Math.max(0, Math.min(maxVisible, Math.floor(list.scrollTop / wordListVirtualState.estimatedItemHeight)));
+    const stableFirst = roughVisible;
+    const maxStart = Math.max(0, total - wordListVirtualState.windowSize);
+    const nextStart = Math.max(0, Math.min(maxStart, stableFirst - wordListVirtualState.preloadBuffer));
+    const nextEnd = Math.min(total, Math.max(nextStart + wordListVirtualState.windowSize, stableFirst + wordListVirtualState.preloadBuffer));
+    if (nextStart !== wordListVirtualState.startIndex || nextEnd !== wordListVirtualState.endIndex) {
+      wordListVirtualState.startIndex = nextStart;
+      wordListVirtualState.endIndex = nextEnd;
+      renderWordListVirtualWindow();
+    }
+    wordListSettleTimer = null;
+  }, 90);
 }
 
 function addChapter() {
@@ -2125,7 +2250,9 @@ function switchTab(tab, btnElement) {
     }
     if(tab === 'progress') {
       const container = document.getElementById('progress-view-container');
-      if (container && container.childElementCount === 0) {
+      const host = document.getElementById('progress-items-host');
+      const virtualHostEmpty = !!(host && host.childElementCount === 0);
+      if (container && (container.childElementCount === 0 || virtualHostEmpty)) {
         applySavedProgressFilters();
         renderProgressView();
       } else if (typeof updateTimeDisplays === 'function') {
@@ -2245,6 +2372,7 @@ function renderProgressView() {
 
   if (!chId) {
     progressVirtualState = null;
+    progressChunkState = null;
     statusDiv.innerHTML = '章を選択してください';
     return;
   }
@@ -2301,6 +2429,7 @@ function renderProgressView() {
     });
     if (displayWords.length === 0 && totalWords > 0) {
       progressVirtualState = null;
+      progressChunkState = null;
       container.innerHTML = '<div style="text-align:center; padding: 20px; font-weight: bold; color: #27ae60;">🎉 苦手な単語はありません</div>';
       return;
     }
@@ -2314,6 +2443,7 @@ function renderProgressView() {
     });
     if (displayWords.length === 0) {
       progressVirtualState = null;
+      progressChunkState = null;
       container.innerHTML = '<div style="text-align:center; padding: 20px; color: #7f8c8d;">検索に一致する単語が見つかりません</div>';
       return;
     }
@@ -2424,8 +2554,12 @@ function renderProgressView() {
 
     appendChunk();
     progressVirtualState = null;
+    progressChunkState = null;
     return;
   }
+
+  progressVirtualState = null;
+  progressChunkState = null;
   if (progressSettleTimer) {
     clearTimeout(progressSettleTimer);
     progressSettleTimer = null;
@@ -2434,29 +2568,48 @@ function renderProgressView() {
   const currentToken = progressTableRenderToken;
   container.innerHTML = '';
   const now = Date.now();
-  let index = 0;
-  let restoredScroll = false;
-
-  const appendListChunk = () => {
-    if (currentToken !== progressTableRenderToken) return;
-    const end = Math.min(displayWords.length, index + RENDER_BATCH_SIZE);
-    let html = '';
-    for (; index < end; index++) {
-      html += createListCardHtml(displayWords[index], now);
-    }
-    if (html) container.insertAdjacentHTML('beforeend', html);
-
-    if (!restoredScroll) {
-      container.scrollTop = savedScrollTop;
-      restoredScroll = true;
-    }
-
-    if (index < displayWords.length) requestAnimationFrame(appendListChunk);
-    else if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+  progressChunkState = {
+    container,
+    words: displayWords,
+    token: currentToken,
+    nextIndex: 0,
+    renderListCard: createListCardHtml,
+    now,
+    renderedIds: new Set()
   };
 
-  appendListChunk();
-  progressVirtualState = null;
+  appendProgressChunk(INITIAL_RENDER_BATCH_SIZE);
+  container.scrollTop = savedScrollTop;
+
+  let fillGuard = 0;
+  while (progressChunkState && progressChunkState.nextIndex < displayWords.length && container.scrollTop + container.clientHeight >= container.scrollHeight - 200 && fillGuard < 6) {
+    appendProgressChunk(RENDER_BATCH_SIZE);
+    fillGuard++;
+  }
+
+  if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+}
+
+function appendProgressChunk(count = RENDER_BATCH_SIZE) {
+  if (!progressChunkState) return;
+  const { container, words, token, renderListCard, now, renderedIds } = progressChunkState;
+  if (!container || token !== progressTableRenderToken) return;
+
+  const end = Math.min(words.length, progressChunkState.nextIndex + count);
+  if (progressChunkState.nextIndex >= end) return;
+
+  let html = '';
+  for (let i = progressChunkState.nextIndex; i < end; i++) {
+    const word = words[i];
+    if (!word || !word.id || renderedIds.has(word.id)) continue;
+    renderedIds.add(word.id);
+    html += renderListCard(word, now);
+  }
+  progressChunkState.nextIndex = end;
+  if (html) {
+    container.insertAdjacentHTML('beforeend', html);
+    if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+  }
 }
 
 function renderProgressVirtualWindow() {
@@ -2475,8 +2628,13 @@ function renderProgressVirtualWindow() {
   progressVirtualState.bottomSpacerEl = bottomSpacer;
   progressVirtualState.hostEl = host;
 
-  topSpacer.style.height = `${startIndex * estimatedItemHeight}px`;
-  bottomSpacer.style.height = `${Math.max(0, (words.length - endIndex) * estimatedItemHeight)}px`;
+  const applyProgressSpacerHeights = () => {
+    const topH = progressVirtualState.startIndex * progressVirtualState.estimatedItemHeight;
+    topSpacer.style.height = `${topH}px`;
+    bottomSpacer.style.height = `${Math.max(0, (words.length - progressVirtualState.endIndex) * progressVirtualState.estimatedItemHeight)}px`;
+  };
+
+  applyProgressSpacerHeights();
 
   const createCard = (word) => {
     const template = document.createElement('template');
@@ -2539,6 +2697,40 @@ function renderProgressVirtualWindow() {
 
   progressVirtualState.renderedStart = currentStart;
   progressVirtualState.renderedEnd = currentEnd;
+
+  let measuredTotal = 0;
+  let measuredCount = 0;
+  for (const child of host.children) {
+    measuredTotal += child.offsetHeight;
+    measuredCount++;
+  }
+  if (measuredCount > 0 && (Date.now() - (progressVirtualState.lastScrollAt || 0)) > 120) {
+    const measuredAverage = measuredTotal / measuredCount;
+    const prev = progressVirtualState.estimatedItemHeight;
+    const next = prev * 0.8 + measuredAverage * 0.2;
+    if (Math.abs(next - prev) >= 0.5) {
+      progressVirtualState.estimatedItemHeight = next;
+      applyProgressSpacerHeights();
+    }
+  }
+}
+
+function getProgressFirstVisibleIndex(container, state) {
+  const host = state.hostEl || document.getElementById('progress-items-host');
+  if (!host || state.renderedStart === null) {
+    return Math.max(0, Math.floor(container.scrollTop / state.estimatedItemHeight));
+  }
+
+  const viewTop = container.scrollTop;
+  let idx = 0;
+  for (const child of host.children) {
+    if ((child.offsetTop + child.offsetHeight) > viewTop) {
+      return state.renderedStart + idx;
+    }
+    idx++;
+  }
+
+  return Math.max(0, Math.floor(container.scrollTop / state.estimatedItemHeight));
 }
 
 function handleProgressVirtualScroll() {
@@ -2554,6 +2746,83 @@ function handleProgressVirtualScroll() {
     lastProgressStateSaveAt = Date.now();
     progressScrollSaveTimer = null;
   }, 220);
+
+  if (progressChunkState) {
+    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 300) {
+      appendProgressChunk(RENDER_BATCH_SIZE);
+    }
+    return;
+  }
+
+  if (!progressVirtualState || progressVirtualState.layoutMode === 'table') return;
+  progressVirtualState.lastScrollAt = Date.now();
+  if (progressScrollRafPending) return;
+
+  progressScrollRafPending = true;
+  requestAnimationFrame(() => {
+    progressScrollRafPending = false;
+    if (!progressVirtualState || progressVirtualState.layoutMode === 'table') return;
+
+    const total = progressVirtualState.words.length;
+    if (total === 0) return;
+
+    const nowTs = performance.now();
+    const prevTop = typeof progressVirtualState.lastScrollTop === 'number' ? progressVirtualState.lastScrollTop : container.scrollTop;
+    const prevTime = typeof progressVirtualState.lastScrollTime === 'number' ? progressVirtualState.lastScrollTime : nowTs;
+    const dt = Math.max(1, nowTs - prevTime);
+    const velocity = Math.abs(container.scrollTop - prevTop) / dt;
+    progressVirtualState.lastScrollTop = container.scrollTop;
+    progressVirtualState.lastScrollTime = nowTs;
+
+    const preload = progressVirtualState.preloadBuffer;
+    const base = progressVirtualState.windowSize;
+    const maxVisible = total - 1;
+    const roughVisible = Math.max(0, Math.min(maxVisible, Math.floor(container.scrollTop / progressVirtualState.estimatedItemHeight)));
+    const baseStep = Math.max(1, progressVirtualState.updateStep || 1);
+    let mode = progressVirtualState.scrollStepMode || 1;
+    if (mode === 1 && velocity > 2.0) mode = 2;
+    else if (mode === 2 && velocity > 2.8) mode = 3;
+    else if (mode === 2 && velocity < 1.2) mode = 1;
+    else if (mode === 3 && velocity < 2.0) mode = 2;
+    progressVirtualState.scrollStepMode = mode;
+
+    const dynamicStep = mode === 3 ? baseStep * 3 : (mode === 2 ? baseStep * 2 : 1);
+    const firstVisible = mode === 1 ? roughVisible : Math.floor(roughVisible / dynamicStep) * dynamicStep;
+    const maxStart = Math.max(0, total - base);
+    const nextStart = Math.max(0, Math.min(maxStart, firstVisible - preload));
+    const nextEnd = Math.min(total, Math.max(nextStart + base, firstVisible + preload));
+
+    if (dynamicStep > 1 && Math.abs(nextStart - progressVirtualState.startIndex) < dynamicStep && Math.abs(nextEnd - progressVirtualState.endIndex) < dynamicStep) {
+      return;
+    }
+
+    if (nextStart !== progressVirtualState.startIndex || nextEnd !== progressVirtualState.endIndex) {
+      progressVirtualState.startIndex = nextStart;
+      progressVirtualState.endIndex = nextEnd;
+      renderProgressVirtualWindow();
+    }
+  });
+
+  if (progressSettleTimer) clearTimeout(progressSettleTimer);
+  progressSettleTimer = setTimeout(() => {
+    if (!progressVirtualState || progressVirtualState.layoutMode === 'table') return;
+    progressVirtualState.lastScrollAt = 0;
+    progressVirtualState.scrollStepMode = 1;
+    const total = progressVirtualState.words.length;
+    if (total === 0) return;
+    const maxVisible = total - 1;
+    const roughVisible = Math.max(0, Math.min(maxVisible, Math.floor(container.scrollTop / progressVirtualState.estimatedItemHeight)));
+    const stableFirst = roughVisible;
+    const maxStart = Math.max(0, total - progressVirtualState.windowSize);
+    const nextStart = Math.max(0, Math.min(maxStart, stableFirst - progressVirtualState.preloadBuffer));
+    const nextEnd = Math.min(total, Math.max(nextStart + progressVirtualState.windowSize, stableFirst + progressVirtualState.preloadBuffer));
+    if (nextStart !== progressVirtualState.startIndex || nextEnd !== progressVirtualState.endIndex) {
+      progressVirtualState.startIndex = nextStart;
+      progressVirtualState.endIndex = nextEnd;
+      renderProgressVirtualWindow();
+    }
+    progressSettleTimer = null;
+  }, 90);
 }
 
 // ▼ 2. 通常クイズ開始（フラッシュバグ防止版）
