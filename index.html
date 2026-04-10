@@ -215,6 +215,13 @@ button {
   }
 }
 button:active:not(:disabled) { transform: translateY(1px) scale(0.98); box-shadow: 0 2px 4px var(--button-primary-shadow); }
+/* 同じタブ再押下時は押下アニメーションを出さない */
+.bottom-nav .nav-btn.active:active:not(:disabled) {
+  transform: translateY(-8px);
+  box-shadow: 0 8px 15px var(--shadow-primary);
+  background: var(--primary-soft);
+  color: var(--primary);
+}
 button:disabled { background-color: var(--neutral-btn-soft); color: var(--text-secondary); cursor: not-allowed; box-shadow: none; transform: none; }
 
 /* 操作ボタンのスタイリッシュ化 */
@@ -379,6 +386,7 @@ body.theme-dark .quiz-toggle-label {
   height: 65px;
   border-radius: 50%;
   padding: 0;
+  -webkit-tap-highlight-color: transparent;
   transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
   box-shadow: none;
 }
@@ -1160,6 +1168,12 @@ let wordListSettleTimer = null;
 let progressSettleTimer = null;
 let wordListRenderToken = 0;
 let hasNormalizedInlineStyles = false;
+let suppressWordListScrollSave = false;
+let suppressProgressScrollSave = false;
+let tabSwitchAnimationTimer = null;
+let tabSwitchScrollTimer = null;
+let tabSwitchPostTimer = null;
+let tabSwitchTarget = null;
 
 const RENDER_BATCH_SIZE = 50;
 const INITIAL_RENDER_BATCH_SIZE = 100;
@@ -1665,23 +1679,97 @@ function clearWordListVisibleItems(list, topSpacer, bottomSpacer) {
   }
 }
 
-function appendWordListChunk(count = RENDER_BATCH_SIZE) {
+function updateWordListChunkSpacers() {
   if (!wordListChunkState) return;
-  const { list, words, now, targetThreshold, token, renderedIds } = wordListChunkState;
-  if (!list || token !== wordListRenderToken) return;
+  const { topSpacerEl, bottomSpacerEl, estimatedItemHeight, startIndex, endIndex, words } = wordListChunkState;
+  if (!topSpacerEl || !bottomSpacerEl) return;
+  topSpacerEl.style.height = `${Math.max(0, startIndex * estimatedItemHeight)}px`;
+  bottomSpacerEl.style.height = `${Math.max(0, (words.length - endIndex) * estimatedItemHeight)}px`;
+}
 
-  const end = Math.min(words.length, wordListChunkState.nextIndex + count);
-  if (wordListChunkState.nextIndex >= end) return;
+function appendWordListChunkForward(count = RENDER_BATCH_SIZE) {
+  if (!wordListChunkState) return;
+  const { list, words, now, targetThreshold, token, bottomSpacerEl } = wordListChunkState;
+  if (!list || !bottomSpacerEl || token !== wordListRenderToken) return;
+
+  const from = wordListChunkState.endIndex;
+  const to = Math.min(words.length, from + count);
+  if (from >= to) return;
 
   const fragment = document.createDocumentFragment();
-  for (let i = wordListChunkState.nextIndex; i < end; i++) {
-    const word = words[i];
-    if (!word || !word.id || renderedIds.has(word.id)) continue;
-    renderedIds.add(word.id);
-    fragment.appendChild(createWordListItemElement(word, now, targetThreshold));
+  for (let i = from; i < to; i++) {
+    fragment.appendChild(createWordListItemElement(words[i], now, targetThreshold));
   }
-  wordListChunkState.nextIndex = end;
-  if (fragment.childNodes.length > 0) list.appendChild(fragment);
+  list.insertBefore(fragment, bottomSpacerEl);
+  wordListChunkState.endIndex = to;
+  updateWordListChunkSpacers();
+}
+
+function appendWordListChunkBackward(count = RENDER_BATCH_SIZE) {
+  if (!wordListChunkState) return;
+  const { list, words, now, targetThreshold, token, topSpacerEl, bottomSpacerEl } = wordListChunkState;
+  if (!list || !topSpacerEl || !bottomSpacerEl || token !== wordListRenderToken) return;
+
+  const prevStart = wordListChunkState.startIndex;
+  const nextStart = Math.max(0, prevStart - count);
+  if (nextStart >= prevStart) return;
+
+  const nodes = [];
+  const fragment = document.createDocumentFragment();
+  for (let i = nextStart; i < prevStart; i++) {
+    const node = createWordListItemElement(words[i], now, targetThreshold);
+    nodes.push(node);
+    fragment.appendChild(node);
+  }
+
+  const firstVisible = topSpacerEl.nextSibling && topSpacerEl.nextSibling !== bottomSpacerEl ? topSpacerEl.nextSibling : bottomSpacerEl;
+  list.insertBefore(fragment, firstVisible);
+
+  let addedHeight = 0;
+  for (const node of nodes) addedHeight += node.offsetHeight;
+
+  wordListChunkState.startIndex = nextStart;
+  updateWordListChunkSpacers();
+  if (addedHeight > 0) list.scrollTop += addedHeight;
+}
+
+function ensureWordListChunkCoverage() {
+  if (!wordListChunkState) return;
+  const { list, words, estimatedItemHeight } = wordListChunkState;
+  if (!list || !estimatedItemHeight || words.length === 0) return;
+
+  const buffer = 6;
+  const firstVisible = Math.max(0, Math.floor(list.scrollTop / estimatedItemHeight));
+  const lastVisible = Math.max(firstVisible, Math.floor((list.scrollTop + list.clientHeight) / estimatedItemHeight));
+  const neededStart = Math.max(0, firstVisible - buffer);
+  const neededEnd = Math.min(words.length, lastVisible + buffer + 1);
+
+  const missingBefore = Math.max(0, wordListChunkState.startIndex - neededStart);
+  const missingAfter = Math.max(0, neededEnd - wordListChunkState.endIndex);
+  if (missingBefore > 0 || missingAfter > INITIAL_RENDER_BATCH_SIZE) {
+    const { now, targetThreshold, topSpacerEl, bottomSpacerEl } = wordListChunkState;
+    if (topSpacerEl && bottomSpacerEl) {
+      const half = Math.floor(INITIAL_RENDER_BATCH_SIZE / 2);
+      const anchorStart = Math.max(0, firstVisible - half);
+      const anchorEnd = Math.min(words.length, anchorStart + INITIAL_RENDER_BATCH_SIZE);
+      clearWordListVisibleItems(list, topSpacerEl, bottomSpacerEl);
+      const fragment = document.createDocumentFragment();
+      for (let i = anchorStart; i < anchorEnd; i++) {
+        fragment.appendChild(createWordListItemElement(words[i], now, targetThreshold));
+      }
+      list.insertBefore(fragment, bottomSpacerEl);
+      wordListChunkState.startIndex = anchorStart;
+      wordListChunkState.endIndex = anchorEnd;
+      updateWordListChunkSpacers();
+      return;
+    }
+  }
+
+  let guard = 0;
+  while (wordListChunkState && wordListChunkState.endIndex < neededEnd && guard < 20) {
+    appendWordListChunkForward(RENDER_BATCH_SIZE);
+    guard++;
+  }
 }
 
 function renderWordList() {
@@ -1734,24 +1822,49 @@ function renderWordList() {
   const now = Date.now();
   const targetThreshold = getCurrentMasteryThreshold();
   const currentToken = wordListRenderToken;
+  const estimatedItemHeight = 110;
+  const anchorIndex = Math.max(0, Math.min(words.length - 1, Math.floor(savedScrollTop / estimatedItemHeight)));
+  const half = Math.floor(INITIAL_RENDER_BATCH_SIZE / 2);
+  const startIndex = Math.max(0, anchorIndex - half);
+  const endIndex = Math.min(words.length, startIndex + INITIAL_RENDER_BATCH_SIZE);
+
+  const topSpacer = document.createElement('li');
+  topSpacer.style.margin = '0';
+  topSpacer.style.padding = '0';
+  topSpacer.style.border = 'none';
+  topSpacer.style.boxShadow = 'none';
+  topSpacer.style.background = 'transparent';
+
+  const bottomSpacer = document.createElement('li');
+  bottomSpacer.style.margin = '0';
+  bottomSpacer.style.padding = '0';
+  bottomSpacer.style.border = 'none';
+  bottomSpacer.style.boxShadow = 'none';
+  bottomSpacer.style.background = 'transparent';
+
+  list.appendChild(topSpacer);
+  list.appendChild(bottomSpacer);
+
   wordListChunkState = {
     list,
     words,
     now,
     targetThreshold,
     token: currentToken,
-    nextIndex: 0,
-    renderedIds: new Set()
+    estimatedItemHeight,
+    startIndex,
+    endIndex: startIndex,
+    topSpacerEl: topSpacer,
+    bottomSpacerEl: bottomSpacer
   };
 
-  appendWordListChunk(INITIAL_RENDER_BATCH_SIZE);
-  list.scrollTop = savedScrollTop;
+  updateWordListChunkSpacers();
+  appendWordListChunkForward(endIndex - startIndex);
 
-  let fillGuard = 0;
-  while (wordListChunkState && wordListChunkState.nextIndex < words.length && list.scrollTop + list.clientHeight >= list.scrollHeight - 200 && fillGuard < 6) {
-    appendWordListChunk(RENDER_BATCH_SIZE);
-    fillGuard++;
-  }
+  const restoreTarget = Math.max(0, savedScrollTop);
+  list.scrollTop = restoreTarget;
+  ensureWordListChunkCoverage();
+  setTimeout(() => { suppressWordListScrollSave = false; }, 0);
 }
 
 function renderWordListVirtualWindow() {
@@ -1897,6 +2010,7 @@ function getWordListFirstVisibleIndex(list, state) {
 function handleWordListVirtualScroll() {
   const list = document.getElementById('word-list');
   if (!list) return;
+  if (suppressWordListScrollSave) return;
 
   if (wordListScrollSaveTimer) clearTimeout(wordListScrollSaveTimer);
   wordListScrollSaveTimer = setTimeout(() => {
@@ -1911,9 +2025,7 @@ function handleWordListVirtualScroll() {
   }, 220);
 
   if (wordListChunkState) {
-    if (list.scrollTop + list.clientHeight >= list.scrollHeight - 300) {
-      appendWordListChunk(RENDER_BATCH_SIZE);
-    }
+    ensureWordListChunkCoverage();
     return;
   }
 
@@ -2184,6 +2296,62 @@ function importCSV() {
 
 // ▼ 6. タブ切り替え処理（フリッカー防止版）
 function switchTab(tab, btnElement) {
+  const currentPanel = document.querySelector('.panel.active');
+  const nextPanel = document.getElementById(`${tab}-panel`);
+  if (!nextPanel) return;
+
+  const activeTab = currentPanel && currentPanel.id ? currentPanel.id.replace('-panel', '') : null;
+  if (tabSwitchTarget === tab || (activeTab === tab && tabSwitchTarget === null)) {
+    return;
+  }
+
+  if (tabSwitchAnimationTimer) { clearTimeout(tabSwitchAnimationTimer); tabSwitchAnimationTimer = null; }
+  if (tabSwitchScrollTimer) { clearTimeout(tabSwitchScrollTimer); tabSwitchScrollTimer = null; }
+  if (tabSwitchPostTimer) { clearTimeout(tabSwitchPostTimer); tabSwitchPostTimer = null; }
+  tabSwitchTarget = tab;
+
+  if (currentPanel && currentPanel !== nextPanel) {
+    if (currentPanel.id === 'manage-panel') {
+      const list = document.getElementById('word-list');
+      if (list) {
+        suppressWordListScrollSave = true;
+        if (wordListScrollSaveTimer) {
+          clearTimeout(wordListScrollSaveTimer);
+          wordListScrollSaveTimer = null;
+        }
+        const fEl = document.getElementById('filter-chapter-select');
+        const f = fEl ? fEl.value : 'all';
+        const stateKey = `${appData.currentBookId || 'no-book'}|${f}`;
+        saveWordListViewState({
+          lastKey: stateKey,
+          scrollTop: list.scrollTop,
+          filterChapterId: f
+        });
+        list.innerHTML = '';
+      }
+      wordListChunkState = null;
+      wordListVirtualState = null;
+    }
+
+    if (currentPanel.id === 'progress-panel') {
+      const container = document.getElementById('progress-view-container');
+      if (container) {
+        suppressProgressScrollSave = true;
+        if (progressScrollSaveTimer) {
+          clearTimeout(progressScrollSaveTimer);
+          progressScrollSaveTimer = null;
+        }
+        const cfg = getProgressViewConfig();
+        const key = JSON.stringify(cfg);
+        const scrollKey = getProgressScrollKey(cfg);
+        saveProgressViewState({ ...cfg, lastViewKey: key, lastScrollKey: scrollKey, scrollTop: container.scrollTop });
+        container.innerHTML = '';
+      }
+      progressChunkState = null;
+      progressVirtualState = null;
+    }
+  }
+
   clearInterval(countdownTimer);
   if (typeof triggerVibration === 'function') {
     triggerVibration(20);
@@ -2208,17 +2376,15 @@ function switchTab(tab, btnElement) {
     backBtn.style.pointerEvents = 'auto';
   }
 
-  const currentPanel = document.querySelector('.panel.active');
-  const nextPanel = document.getElementById(`${tab}-panel`);
-  
   if(currentPanel && currentPanel !== nextPanel) {
     currentPanel.style.animation = 'fadeOutDown 0.15s forwards';
-    setTimeout(() => {
+    tabSwitchAnimationTimer = setTimeout(() => {
       currentPanel.classList.remove('active');
       currentPanel.style.animation = '';
       nextPanel.classList.add('active');
       nextPanel.style.opacity = '0';
       nextPanel.style.animation = 'slideInUp 0.3s forwards';
+      tabSwitchAnimationTimer = null;
     }, 150);
   } else if (!currentPanel) {
     nextPanel.classList.add('active');
@@ -2239,11 +2405,12 @@ function switchTab(tab, btnElement) {
   }
   
   // ▼ 変更：アニメーションが終わった直後に「なめらかスクロール」を発動させる
-  setTimeout(() => {
+  tabSwitchScrollTimer = setTimeout(() => {
     window.scrollTo({ top: 0, behavior: 'auto' });
+    tabSwitchScrollTimer = null;
   }, 150);
 
-  setTimeout(() => {
+  tabSwitchPostTimer = setTimeout(() => {
     if(tab === 'manage') {
       const list = document.getElementById('word-list');
       if (list && list.childElementCount === 0) renderWordList();
@@ -2259,6 +2426,8 @@ function switchTab(tab, btnElement) {
         updateTimeDisplays();
       }
     }
+    tabSwitchTarget = null;
+    tabSwitchPostTimer = null;
   }, 200);
 }
 
@@ -2568,47 +2737,137 @@ function renderProgressView() {
   const currentToken = progressTableRenderToken;
   container.innerHTML = '';
   const now = Date.now();
+  const estimatedItemHeight = 210;
+  const anchorIndex = Math.max(0, Math.min(displayWords.length - 1, Math.floor(savedScrollTop / estimatedItemHeight)));
+  const half = Math.floor(INITIAL_RENDER_BATCH_SIZE / 2);
+  const startIndex = Math.max(0, anchorIndex - half);
+  const endIndex = Math.min(displayWords.length, startIndex + INITIAL_RENDER_BATCH_SIZE);
+
+  container.innerHTML = '<div id="progress-top-spacer"></div><div id="progress-items-host"></div><div id="progress-bottom-spacer"></div>';
+  const topSpacerEl = document.getElementById('progress-top-spacer');
+  const hostEl = document.getElementById('progress-items-host');
+  const bottomSpacerEl = document.getElementById('progress-bottom-spacer');
+
   progressChunkState = {
     container,
     words: displayWords,
     token: currentToken,
-    nextIndex: 0,
     renderListCard: createListCardHtml,
     now,
-    renderedIds: new Set()
+    estimatedItemHeight,
+    startIndex,
+    endIndex: startIndex,
+    topSpacerEl,
+    hostEl,
+    bottomSpacerEl
   };
 
-  appendProgressChunk(INITIAL_RENDER_BATCH_SIZE);
-  container.scrollTop = savedScrollTop;
-
-  let fillGuard = 0;
-  while (progressChunkState && progressChunkState.nextIndex < displayWords.length && container.scrollTop + container.clientHeight >= container.scrollHeight - 200 && fillGuard < 6) {
-    appendProgressChunk(RENDER_BATCH_SIZE);
-    fillGuard++;
-  }
+  updateProgressChunkSpacers();
+  appendProgressChunkForward(endIndex - startIndex);
+  container.scrollTop = Math.max(0, savedScrollTop);
+  ensureProgressChunkCoverage();
+  setTimeout(() => { suppressProgressScrollSave = false; }, 0);
 
   if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
 }
 
-function appendProgressChunk(count = RENDER_BATCH_SIZE) {
+function updateProgressChunkSpacers() {
   if (!progressChunkState) return;
-  const { container, words, token, renderListCard, now, renderedIds } = progressChunkState;
-  if (!container || token !== progressTableRenderToken) return;
+  const { words, startIndex, endIndex, estimatedItemHeight, topSpacerEl, bottomSpacerEl } = progressChunkState;
+  if (!topSpacerEl || !bottomSpacerEl) return;
+  topSpacerEl.style.height = `${Math.max(0, startIndex * estimatedItemHeight)}px`;
+  bottomSpacerEl.style.height = `${Math.max(0, (words.length - endIndex) * estimatedItemHeight)}px`;
+}
 
-  const end = Math.min(words.length, progressChunkState.nextIndex + count);
-  if (progressChunkState.nextIndex >= end) return;
+function appendProgressChunkForward(count = RENDER_BATCH_SIZE) {
+  if (!progressChunkState) return;
+  const { words, token, renderListCard, now, hostEl } = progressChunkState;
+  if (!hostEl || token !== progressTableRenderToken) return;
+
+  const from = progressChunkState.endIndex;
+  const end = Math.min(words.length, from + count);
+  if (from >= end) return;
 
   let html = '';
-  for (let i = progressChunkState.nextIndex; i < end; i++) {
-    const word = words[i];
-    if (!word || !word.id || renderedIds.has(word.id)) continue;
-    renderedIds.add(word.id);
-    html += renderListCard(word, now);
+  for (let i = from; i < end; i++) {
+    html += renderListCard(words[i], now);
   }
-  progressChunkState.nextIndex = end;
-  if (html) {
-    container.insertAdjacentHTML('beforeend', html);
-    if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+  progressChunkState.endIndex = end;
+  if (html) hostEl.insertAdjacentHTML('beforeend', html);
+  updateProgressChunkSpacers();
+  if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+}
+
+function appendProgressChunkBackward(count = RENDER_BATCH_SIZE) {
+  if (!progressChunkState) return;
+  const { words, token, renderListCard, now, hostEl, container } = progressChunkState;
+  if (!hostEl || !container || token !== progressTableRenderToken) return;
+
+  const prevStart = progressChunkState.startIndex;
+  const nextStart = Math.max(0, prevStart - count);
+  if (nextStart >= prevStart) return;
+
+  let html = '';
+  for (let i = nextStart; i < prevStart; i++) {
+    html += renderListCard(words[i], now);
+  }
+  if (!html) return;
+
+  const marker = document.createElement('div');
+  hostEl.insertBefore(marker, hostEl.firstChild);
+  marker.insertAdjacentHTML('beforebegin', html);
+
+  let addedHeight = 0;
+  let node = hostEl.firstChild;
+  while (node && node !== marker) {
+    addedHeight += node.offsetHeight;
+    node = node.nextSibling;
+  }
+  marker.remove();
+
+  progressChunkState.startIndex = nextStart;
+  updateProgressChunkSpacers();
+  if (addedHeight > 0) container.scrollTop += addedHeight;
+
+  if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+}
+
+function ensureProgressChunkCoverage() {
+  if (!progressChunkState) return;
+  const { container, words, estimatedItemHeight } = progressChunkState;
+  if (!container || !estimatedItemHeight || words.length === 0) return;
+
+  const buffer = 4;
+  const firstVisible = Math.max(0, Math.floor(container.scrollTop / estimatedItemHeight));
+  const lastVisible = Math.max(firstVisible, Math.floor((container.scrollTop + container.clientHeight) / estimatedItemHeight));
+  const neededStart = Math.max(0, firstVisible - buffer);
+  const neededEnd = Math.min(words.length, lastVisible + buffer + 1);
+
+  const missingBefore = Math.max(0, progressChunkState.startIndex - neededStart);
+  const missingAfter = Math.max(0, neededEnd - progressChunkState.endIndex);
+  if (missingBefore > 0 || missingAfter > INITIAL_RENDER_BATCH_SIZE) {
+    const { hostEl, renderListCard, now } = progressChunkState;
+    if (hostEl) {
+      const half = Math.floor(INITIAL_RENDER_BATCH_SIZE / 2);
+      const anchorStart = Math.max(0, firstVisible - half);
+      const anchorEnd = Math.min(words.length, anchorStart + INITIAL_RENDER_BATCH_SIZE);
+      let html = '';
+      for (let i = anchorStart; i < anchorEnd; i++) {
+        html += renderListCard(words[i], now);
+      }
+      hostEl.innerHTML = html;
+      progressChunkState.startIndex = anchorStart;
+      progressChunkState.endIndex = anchorEnd;
+      updateProgressChunkSpacers();
+      if (typeof updateTimeDisplays === 'function') updateTimeDisplays();
+      return;
+    }
+  }
+
+  let guard = 0;
+  while (progressChunkState && progressChunkState.endIndex < neededEnd && guard < 20) {
+    appendProgressChunkForward(RENDER_BATCH_SIZE);
+    guard++;
   }
 }
 
@@ -2736,6 +2995,7 @@ function getProgressFirstVisibleIndex(container, state) {
 function handleProgressVirtualScroll() {
   const container = document.getElementById('progress-view-container');
   if (!container) return;
+  if (suppressProgressScrollSave) return;
 
   const activeConfig = progressVirtualState ? progressVirtualState.config : getProgressViewConfig();
   const activeKey = progressVirtualState ? progressVirtualState.viewKey : JSON.stringify(activeConfig);
@@ -2748,9 +3008,7 @@ function handleProgressVirtualScroll() {
   }, 220);
 
   if (progressChunkState) {
-    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 300) {
-      appendProgressChunk(RENDER_BATCH_SIZE);
-    }
+    ensureProgressChunkCoverage();
     return;
   }
 
