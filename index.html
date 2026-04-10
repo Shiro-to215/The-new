@@ -789,14 +789,19 @@ li {
       <label style="font-weight: bold; color: #2c3e50; margin-top: 15px; display: block;">出題する章:</label>
       <div id="quiz-chapter-checkboxes" style="margin-bottom: 20px; padding: 15px; background: #f8f9fa; border-radius: 12px; max-height: 200px; overflow-y: auto; border: 1px solid #e2e8f0;"></div>
       <div class="setting-box">
-  <label style="font-weight: bold; cursor: pointer; display: flex; align-items: center; gap: 8px;">
-    <input type="checkbox" id="auto-level-toggle" style="transform: scale(1.2);">
-    🤖 出題レベル自動最適化（オートモード）
-  </label>
-  <p style="font-size: 0.85em; color: #666; margin-top: 5px;">
-    ※ONにすると、各単語の「習得ポイント」に応じて、制限時間と例文表示が自動で7段階に切り替わります（手動設定は無効になります）。
-  </p>
-</div>
+        <label style="font-weight: bold; color: var(--text-primary); display: block; margin-bottom: 10px;">🤖 出題レベル自動最適化（オートモード）:</label>
+        <div style="margin-bottom: 8px; display: flex; gap: 15px; align-items: center; background: var(--bg-muted); padding: 15px; border-radius: 12px; border: 1px solid var(--border-soft);">
+          <span class="quiz-toggle-label">OFF</span>
+          <label class="toggle-switch" style="cursor: pointer;">
+            <input type="checkbox" id="auto-level-toggle" onchange="updateQuizAutoModeUI()">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="quiz-toggle-label">ON</span>
+        </div>
+        <p style="font-size: 0.85em; color: #666; margin-top: 5px;">
+          ※ONにすると、各単語の「習得ポイント」に応じて、制限時間と例文表示が自動で7段階に切り替わります（手動設定はオフになります）。
+        </p>
+      </div>
       <label style="font-weight: bold; color: var(--text-primary); display: block; margin-bottom: 10px;">出題形式:</label>
       <div style="margin-bottom: 20px; display: flex; gap: 15px; align-items: center; background: var(--bg-muted); padding: 15px; border-radius: 12px; border: 1px solid var(--border-soft);">
         <span class="quiz-toggle-label">英語 → 日本語</span>
@@ -807,14 +812,16 @@ li {
         <span class="quiz-toggle-label">日本語 → 英語</span>
       </div>
 
-      <label style="font-weight: bold; color: var(--text-primary); display: block; margin-bottom: 10px;">例文の表示:</label>
-      <div style="margin-bottom: 20px; display: flex; gap: 15px; align-items: center; background: var(--bg-muted); padding: 15px; border-radius: 12px; border: 1px solid var(--border-soft);">
-        <span class="quiz-toggle-label">なし</span>
-        <label class="toggle-switch" style="cursor: pointer;">
-          <input type="checkbox" id="quiz-mode-toggle">
-          <span class="toggle-slider"></span>
-        </label>
-        <span class="quiz-toggle-label">あり</span>
+      <div id="quiz-mode-setting-block">
+        <label style="font-weight: bold; color: var(--text-primary); display: block; margin-bottom: 10px;">例文の表示:</label>
+        <div style="margin-bottom: 20px; display: flex; gap: 15px; align-items: center; background: var(--bg-muted); padding: 15px; border-radius: 12px; border: 1px solid var(--border-soft);">
+          <span class="quiz-toggle-label">なし</span>
+          <label class="toggle-switch" style="cursor: pointer;">
+            <input type="checkbox" id="quiz-mode-toggle">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="quiz-toggle-label">あり</span>
+        </div>
       </div>
 
       <div style="display: flex; gap: 15px; margin-bottom: 25px;">
@@ -826,7 +833,7 @@ li {
             <option value="100">100問</option>
           </select>
         </div>
-        <div style="flex: 1;">
+        <div id="quiz-time-limit-setting-block" style="flex: 1;">
           <label style="font-weight: bold; color: #2c3e50; display: block;">制限時間(1問):</label>
           <select id="quiz-time-limit" style="background: #f8f9fa; border: 2px solid #e2e8f0; margin-top: 5px;">
             <option value="0">なし</option><option value="2">2秒</option>
@@ -3487,6 +3494,7 @@ function importData() {
 }
 
 try { loadData(); } catch(e) {}
+try { updateQuizAutoModeUI(); } catch(e) {}
 
 setInterval(() => { if (typeof updateTimeDisplays === 'function') updateTimeDisplays(); }, 30000);
 
@@ -3515,6 +3523,17 @@ function getAutoModeSettings(streak, targetThreshold) {
   return { timeLimit: 2,  showExample: false };                  // 85%以上 (ほぼ完成)
 }
 // ▲▲ ここまで ▲▲
+
+function updateQuizAutoModeUI() {
+  const autoToggle = document.getElementById('auto-level-toggle');
+  const modeBlock = document.getElementById('quiz-mode-setting-block');
+  const timeBlock = document.getElementById('quiz-time-limit-setting-block');
+  if (!autoToggle) return;
+
+  const isAuto = !!autoToggle.checked;
+  if (modeBlock) modeBlock.style.display = isAuto ? 'none' : '';
+  if (timeBlock) timeBlock.style.display = isAuto ? 'none' : '';
+}
 
 // ▼▼ 最終形態Ver4：クイズ画面中だけ正確に鳴らす ▼▼
 document.addEventListener('click', function(event) {
