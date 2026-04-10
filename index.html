@@ -2977,13 +2977,7 @@ function nextQuestion() {
   } else {
     questionText = `<div>${curQ.en}</div>`;
     if (currentQuestionMode === 'example') {
-      let displayEx = curQ.ex || '';
-      if (curQ.en && curQ.ex) {
-        try {
-            const regex = new RegExp(`(${curQ.en})`, 'gi');
-            displayEx = curQ.ex.replace(regex, '\u200b<strong>$1</strong>\u200b');
-        } catch(e) {} // 記号エラー対策
-      }
+      const displayEx = curQ.ex ? createMaskableText(curQ.ex, true, false, curQ.en || '') : '';
       questionText += `<div style="font-size:16px; color:#57606f; margin-top:10px;">${displayEx}</div>`;
       hintText = `<div id="hint-box" class="hidden" style="font-size:16px; margin-top:15px; color:#f39c12;">💡 ${curQ.exJa || ''}</div>`;
     }
