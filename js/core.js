@@ -46,7 +46,9 @@ try {
     currentUser = user;
     if (user) {
       showToast(`✅ ${user.displayName || 'ユーザー'} さんとして同期中`);
-      loadFromCloud();
+      loadFromCloud().catch(() => {
+        showToast("☁️ 同期に失敗しました（ローカルデータを使用）");
+      });
     }
     updateAccountUI();
   });
@@ -57,6 +59,7 @@ async function loadFromCloud() {
   const doc = await db.collection("users").doc(currentUser.uid).get();
   if (!doc.exists || !doc.data().appData) {
     await syncToCloud(appData);
+    showToast("☁️ クラウドを初期化しました");
     return;
   }
 
