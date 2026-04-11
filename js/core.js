@@ -159,10 +159,23 @@ async function syncToCloud(data) {
     ...data,
     clientUpdatedAt: Number(data && data.clientUpdatedAt) || Date.now()
   };
-  await db.collection("users").doc(currentUser.uid).set({
-    appData: payload,
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-  }, { merge: true });
+  await db.runTransaction(async (transaction) => {
+    const ref = db.collection("users").doc(currentUser.uid);
+    const doc = await transaction.get(ref);
+    const cloudUpdatedAt = doc.exists && doc.data() && doc.data().appData
+      ? Number(doc.data().appData.clientUpdatedAt) || 0
+      : 0;
+    const localUpdatedAt = Number(payload.clientUpdatedAt) || 0;
+
+    if (cloudUpdatedAt > localUpdatedAt) {
+      return;
+    }
+
+    transaction.set(ref, {
+      appData: payload,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  });
 }
 
 let appData = { books: [], currentBookId: null, chapters: [], words: [], masteryThreshold: 5, quizSessionId: 0, deviceLayout: 'iphone', themeMode: 'light' };
@@ -287,7 +300,8 @@ function showToast(message) {
 function triggerVibration(pattern) { if (navigator.vibrate) navigator.vibrate(pattern); }
 
 function saveData() {
-  appData.clientUpdatedAt = Date.now();
+  const nextUpdatedAt = Math.max(Date.now(), (Number(appData.clientUpdatedAt) || 0) + 1);
+  appData.clientUpdatedAt = nextUpdatedAt;
   localStorage.setItem('vocabApp_Ultimate_V10', JSON.stringify(appData));
   if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
   cloudSyncTimer = setTimeout(() => {
