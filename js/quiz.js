@@ -223,6 +223,11 @@ function endQuiz() {
   showResults();
 }
 
+function getQuizAutoNextSeconds() {
+  const fastToggle = document.getElementById('quiz-auto-next-fast-toggle');
+  return fastToggle && fastToggle.checked ? 1 : 10;
+}
+
 function checkAnswer(id, btn, isTimeout = false) {
   clearInterval(timer);
   clearInterval(countdownTimer);
@@ -259,7 +264,7 @@ function checkAnswer(id, btn, isTimeout = false) {
   const nBtn = document.getElementById('next-btn');
   const isLast = qIdx >= quizPool.length;
   nBtn.classList.remove('hidden');
-  let sec = 10;
+  let sec = getQuizAutoNextSeconds();
   const updateText = () => nBtn.innerText = (isLast ? '結果を見る' : '次へ') + ` (${sec}s)`;
   updateText();
   timer = setInterval(() => {
