@@ -72,6 +72,11 @@ document.addEventListener('click', function(event) {
         return;
     }
 
+  // 問題カード内のタップは quiz.js 側の専用ハンドラに任せる
+  if (event.target.closest('.question-card')) {
+    return;
+  }
+
     const quizScreen = document.getElementById('quiz-play');
     if (!quizScreen || quizScreen.classList.contains('hidden')) {
         return;
