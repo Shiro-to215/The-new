@@ -56,7 +56,8 @@ try {
 
 async function loadFromCloud() {
   if (!db || !currentUser) return;
-  const doc = await db.collection("users").doc(currentUser.uid).get();
+  const userRef = db.collection("users").doc(currentUser.uid);
+  const doc = await userRef.get();
   if (!doc.exists || !doc.data().appData) {
     await syncToCloud(appData);
     showToast("☁️ クラウドを初期化しました");
@@ -74,6 +75,11 @@ async function loadFromCloud() {
   }
 
   appData = cloudData;
+  const isChunkedWords = cloudData && cloudData.wordsStorage === 'chunks';
+  if (isChunkedWords) {
+    appData.words = await loadCloudWordChunks(userRef, Number(cloudData.wordsChunkCount) || 0);
+  }
+  if (!Array.isArray(appData.words)) appData.words = [];
   if (!appData.themeMode) appData.themeMode = 'light';
   if (!appData.books) appData.books = [];
   if (appData.books.length === 0) {
@@ -162,23 +168,86 @@ async function syncToCloud(data) {
     ...data,
     clientUpdatedAt: Number(data && data.clientUpdatedAt) || Date.now()
   };
+  const words = Array.isArray(payload.words) ? payload.words : [];
+  const chunkSize = 450;
+  const chunks = splitWordChunks(words, chunkSize);
+  const appMeta = {
+    ...payload,
+    words: [],
+    wordsStorage: 'chunks',
+    wordsChunkSize: chunkSize,
+    wordsChunkCount: chunks.length,
+    wordsCount: words.length
+  };
+
+  const userRef = db.collection("users").doc(currentUser.uid);
+  const chunkCollection = userRef.collection('wordChunks');
+  let shouldWrite = false;
+  let prevChunkCount = 0;
+
   await db.runTransaction(async (transaction) => {
-    const ref = db.collection("users").doc(currentUser.uid);
-    const doc = await transaction.get(ref);
+    const doc = await transaction.get(userRef);
     const cloudUpdatedAt = doc.exists && doc.data() && doc.data().appData
       ? Number(doc.data().appData.clientUpdatedAt) || 0
       : 0;
-    const localUpdatedAt = Number(payload.clientUpdatedAt) || 0;
+    const localUpdatedAt = Number(appMeta.clientUpdatedAt) || 0;
 
     if (cloudUpdatedAt > localUpdatedAt) {
       return;
     }
 
-    transaction.set(ref, {
-      appData: payload,
+    prevChunkCount = doc.exists && doc.data() && doc.data().appData
+      ? Number(doc.data().appData.wordsChunkCount) || 0
+      : 0;
+    shouldWrite = true;
+
+    transaction.set(userRef, {
+      appData: appMeta,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
   });
+
+  if (!shouldWrite) return;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const id = `chunk_${String(i).padStart(5, '0')}`;
+    await chunkCollection.doc(id).set({
+      index: i,
+      words: chunks[i],
+      clientUpdatedAt: Number(appMeta.clientUpdatedAt) || Date.now(),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  }
+
+  for (let i = chunks.length; i < prevChunkCount; i++) {
+    const id = `chunk_${String(i).padStart(5, '0')}`;
+    await chunkCollection.doc(id).delete().catch(() => {});
+  }
+}
+
+function splitWordChunks(words, chunkSize) {
+  const chunks = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+
+async function loadCloudWordChunks(userRef, chunkCount) {
+  if (!chunkCount || chunkCount <= 0) return [];
+  const reads = [];
+  for (let i = 0; i < chunkCount; i++) {
+    const id = `chunk_${String(i).padStart(5, '0')}`;
+    reads.push(userRef.collection('wordChunks').doc(id).get());
+  }
+  const docs = await Promise.all(reads);
+  const words = [];
+  docs.forEach((d) => {
+    if (!d.exists) return;
+    const chunkWords = d.data() && Array.isArray(d.data().words) ? d.data().words : [];
+    words.push(...chunkWords);
+  });
+  return words;
 }
 
 let appData = { books: [], currentBookId: null, chapters: [], words: [], masteryThreshold: 5, quizSessionId: 0, deviceLayout: 'iphone', themeMode: 'light' };
@@ -339,7 +408,8 @@ async function flushCloudSync() {
     cloudSyncRetryTimer = setTimeout(() => {
       flushCloudSync();
     }, 5000);
-    showToast('☁️ クラウド保存に失敗しました（自動で再試行します）');
+    const code = e && e.code ? ` (${e.code})` : '';
+    showToast(`☁️ クラウド保存に失敗しました${code}（自動で再試行します）`);
   } finally {
     cloudSyncInFlight = false;
     if (pendingSyncUpdatedAt > 0) {
