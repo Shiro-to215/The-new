@@ -188,6 +188,10 @@ let countdownTimer = null;
 let currentQuizTimeLimit = 0;
 let currentQuestionModeGlobal = '';
 let cloudSyncTimer = null;
+let cloudSyncRetryTimer = null;
+let cloudSyncInFlight = false;
+let pendingSyncUpdatedAt = 0;
+let lastCloudSaveToastAt = 0;
 let currentWordRenderIndex = 0;
 let currentWordRenderTarget = [];
 let quizPool = [], qIdx = 0, qMode = '', qDirection = '', curQ = null, timer = null, correctCount = 0;
@@ -302,19 +306,65 @@ function showToast(message) {
 
 function triggerVibration(pattern) { if (navigator.vibrate) navigator.vibrate(pattern); }
 
+function scheduleCloudSync(delayMs = 1200) {
+  if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
+  cloudSyncTimer = setTimeout(() => {
+    flushCloudSync();
+  }, delayMs);
+}
+
+async function flushCloudSync() {
+  if (cloudSyncInFlight) return;
+  if (!pendingSyncUpdatedAt) return;
+  if (!db || !currentUser) return;
+
+  cloudSyncInFlight = true;
+  const snapshot = JSON.parse(JSON.stringify(appData));
+  const sendingUpdatedAt = Number(snapshot.clientUpdatedAt) || 0;
+
+  try {
+    await syncToCloud(snapshot);
+
+    if (pendingSyncUpdatedAt <= sendingUpdatedAt) {
+      pendingSyncUpdatedAt = 0;
+    }
+
+    const now = Date.now();
+    if (now - lastCloudSaveToastAt > 4000) {
+      showToast('☁️ クラウド保存完了');
+      lastCloudSaveToastAt = now;
+    }
+  } catch (e) {
+    if (cloudSyncRetryTimer) clearTimeout(cloudSyncRetryTimer);
+    cloudSyncRetryTimer = setTimeout(() => {
+      flushCloudSync();
+    }, 5000);
+    showToast('☁️ クラウド保存に失敗しました（自動で再試行します）');
+  } finally {
+    cloudSyncInFlight = false;
+    if (pendingSyncUpdatedAt > 0) {
+      scheduleCloudSync(1200);
+    }
+  }
+}
+
 function saveData() {
   const nextUpdatedAt = Math.max(Date.now(), (Number(appData.clientUpdatedAt) || 0) + 1);
   appData.clientUpdatedAt = nextUpdatedAt;
+  pendingSyncUpdatedAt = nextUpdatedAt;
   localStorage.setItem('vocabApp_Ultimate_V10', JSON.stringify(appData));
-  if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
-  cloudSyncTimer = setTimeout(() => {
-    if (typeof syncToCloud === 'function') {
-      syncToCloud(appData).catch(() => {
-        showToast('☁️ クラウド保存に失敗しました');
-      });
-    }
-  }, 3000);
+  scheduleCloudSync(1200);
 }
+
+window.addEventListener('online', () => {
+  if (pendingSyncUpdatedAt > 0) flushCloudSync();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && pendingSyncUpdatedAt > 0) {
+    flushCloudSync();
+  }
+});
 
 function getCurrentMasteryThreshold() {
   if (!appData.currentBookId || !appData.books) return 5;
