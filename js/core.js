@@ -52,40 +52,49 @@ try {
   });
 } catch(e) {}
 
-function loadFromCloud() {
+async function loadFromCloud() {
   if (!db || !currentUser) return;
-  db.collection("users").doc(currentUser.uid).get()
-    .then((doc) => {
-      if (doc.exists && doc.data().appData) {
-        appData = doc.data().appData;
-        if (!appData.themeMode) appData.themeMode = 'light';
-        if (!appData.books) appData.books = [];
-        if (appData.books.length === 0) {
-          const defaultBookId = "book_" + Date.now();
-          appData.books.push({ id: defaultBookId, name: "デフォルト単語帳" });
-          appData.currentBookId = defaultBookId;
-        }
-        if (appData.books.length > 0 && appData.chapters) {
-          appData.chapters.forEach(ch => {
-            if (!ch.bookId) ch.bookId = appData.books[0].id;
-          });
-        }
-        if (appData.books.length > 0) {
-          appData.books.forEach(b => {
-            if (!b.masteryThreshold) b.masteryThreshold = appData.masteryThreshold || 5;
-          });
-        }
-        localStorage.setItem('vocabApp_Ultimate_V10', JSON.stringify(appData));
-        applyThemeMode();
-        updateChapterSelects();
-        renderChapterList();
-        renderWordList();
-        initBookScreen(); 
-        showToast("☁️ クラウドからデータを同期しました");
-      } else {
-        syncToCloud(appData);
-      }
+  const doc = await db.collection("users").doc(currentUser.uid).get();
+  if (!doc.exists || !doc.data().appData) {
+    await syncToCloud(appData);
+    return;
+  }
+
+  const cloudData = doc.data().appData;
+  const localUpdatedAt = Number(appData && appData.clientUpdatedAt) || 0;
+  const cloudUpdatedAt = Number(cloudData && cloudData.clientUpdatedAt) || 0;
+
+  if (localUpdatedAt > cloudUpdatedAt) {
+    await syncToCloud(appData);
+    showToast("☁️ ローカルの新しいデータをクラウドに反映しました");
+    return;
+  }
+
+  appData = cloudData;
+  if (!appData.themeMode) appData.themeMode = 'light';
+  if (!appData.books) appData.books = [];
+  if (appData.books.length === 0) {
+    const defaultBookId = "book_" + Date.now();
+    appData.books.push({ id: defaultBookId, name: "デフォルト単語帳" });
+    appData.currentBookId = defaultBookId;
+  }
+  if (appData.books.length > 0 && appData.chapters) {
+    appData.chapters.forEach(ch => {
+      if (!ch.bookId) ch.bookId = appData.books[0].id;
     });
+  }
+  if (appData.books.length > 0) {
+    appData.books.forEach(b => {
+      if (!b.masteryThreshold) b.masteryThreshold = appData.masteryThreshold || 5;
+    });
+  }
+  localStorage.setItem('vocabApp_Ultimate_V10', JSON.stringify(appData));
+  applyThemeMode();
+  updateChapterSelects();
+  renderChapterList();
+  renderWordList();
+  initBookScreen();
+  showToast("☁️ クラウドからデータを同期しました");
 }
 
 function updateAccountUI() {
@@ -144,11 +153,16 @@ function fbDeleteAccount() {
     .catch((error) => alert("削除失敗: 再ログインが必要です"));
 }
 
-function syncToCloud(data) {
+async function syncToCloud(data) {
   if (!db || !currentUser) return;
-  db.collection("users").doc(currentUser.uid).set({
-    appData: data, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-  });
+  const payload = {
+    ...data,
+    clientUpdatedAt: Number(data && data.clientUpdatedAt) || Date.now()
+  };
+  await db.collection("users").doc(currentUser.uid).set({
+    appData: payload,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
 }
 
 let appData = { books: [], currentBookId: null, chapters: [], words: [], masteryThreshold: 5, quizSessionId: 0, deviceLayout: 'iphone', themeMode: 'light' };
@@ -273,10 +287,15 @@ function showToast(message) {
 function triggerVibration(pattern) { if (navigator.vibrate) navigator.vibrate(pattern); }
 
 function saveData() {
+  appData.clientUpdatedAt = Date.now();
   localStorage.setItem('vocabApp_Ultimate_V10', JSON.stringify(appData));
   if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
   cloudSyncTimer = setTimeout(() => {
-    if (typeof syncToCloud === 'function') syncToCloud(appData);
+    if (typeof syncToCloud === 'function') {
+      syncToCloud(appData).catch(() => {
+        showToast('☁️ クラウド保存に失敗しました');
+      });
+    }
   }, 3000);
 }
 
