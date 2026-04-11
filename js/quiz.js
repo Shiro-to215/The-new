@@ -160,19 +160,22 @@ function nextQuestion() {
       const qCard = document.querySelector('.question-card');
       if (qCard) {
           qCard.style.cursor = 'pointer';
-          qCard.onclick = function() {
-              let textToRead = "";
+          qCard.onclick = function(event) {
+            if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
 
-              if (curQ && curQ.ex && curQ.ex.trim() !== "") {
-                  textToRead = curQ.ex;
-              } else if (curQ && curQ.en) {
-                  textToRead = curQ.en;
-              }
+            let textToRead = "";
+            const isExampleMode = currentQuestionModeGlobal === 'example';
 
-              if (textToRead) {
-                  let cleanText = textToRead.replace(/<[^>]*>?/gm, '');
-                  playVoice(cleanText);
-              }
+            if (isExampleMode && curQ && curQ.ex && curQ.ex.trim() !== "") {
+              textToRead = curQ.ex;
+            } else if (curQ && curQ.en) {
+              textToRead = curQ.en;
+            }
+
+            if (textToRead) {
+              const cleanText = textToRead.replace(/<[^>]*>?/gm, '').trim();
+              if (cleanText) playVoice(cleanText);
+            }
           };
       }
   } catch(e) { console.log("音声再生エラー:", e); }
