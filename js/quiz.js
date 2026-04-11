@@ -1,5 +1,15 @@
+let quizAutoNextSeconds = 10;
+
+function updateQuizAutoNextMode() {
+  const fastToggle = document.getElementById('quiz-auto-next-fast-toggle');
+  const statusEl = document.getElementById('quiz-auto-next-status');
+  quizAutoNextSeconds = fastToggle && fastToggle.checked ? 1 : 10;
+  if (statusEl) statusEl.innerText = `現在: ${quizAutoNextSeconds}秒`;
+}
+
 // ▼ 2. 通常クイズ開始（フラッシュバグ防止版）
 function startQuiz() {
+  updateQuizAutoNextMode();
   unlockSpeech();
   const selected = Array.from(document.querySelectorAll('input[name="quiz-chapters"]:checked')).map(cb => cb.value);
   if (selected.length === 0) return showToast('章を選んでください');
@@ -45,6 +55,7 @@ function startQuiz() {
 
 // ▼ 3. 弱点克服クイズ開始（フラッシュバグ防止版）
 function startWeakQuiz() {
+  updateQuizAutoNextMode();
   unlockSpeech();
   const selected = Array.from(document.querySelectorAll('input[name="quiz-chapters"]:checked')).map(cb => cb.value);
   if (selected.length === 0) return showToast('章を選んでください');
@@ -225,7 +236,8 @@ function endQuiz() {
 
 function getQuizAutoNextSeconds() {
   const fastToggle = document.getElementById('quiz-auto-next-fast-toggle');
-  return fastToggle && fastToggle.checked ? 1 : 10;
+  if (fastToggle) return fastToggle.checked ? 1 : 10;
+  return quizAutoNextSeconds;
 }
 
 function checkAnswer(id, btn, isTimeout = false) {
@@ -364,3 +376,5 @@ function executeQuitQuiz() {
   
   setTimeout(() => { renderWordList(); }, 310);
 }
+
+updateQuizAutoNextMode();
