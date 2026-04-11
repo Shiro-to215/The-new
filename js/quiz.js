@@ -162,7 +162,7 @@ function nextQuestion() {
           qCard.style.cursor = 'pointer';
           qCard.onclick = function(event) {
               if (event && typeof event.preventDefault === 'function') event.preventDefault();
-            if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+              if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
               if (event && typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
 
             let textToRead = "";
