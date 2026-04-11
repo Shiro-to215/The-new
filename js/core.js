@@ -397,19 +397,12 @@ async function flushCloudSync() {
     if (pendingSyncUpdatedAt <= sendingUpdatedAt) {
       pendingSyncUpdatedAt = 0;
     }
-
-    const now = Date.now();
-    if (now - lastCloudSaveToastAt > 4000) {
-      showToast('☁️ クラウド保存完了');
-      lastCloudSaveToastAt = now;
-    }
   } catch (e) {
     if (cloudSyncRetryTimer) clearTimeout(cloudSyncRetryTimer);
     cloudSyncRetryTimer = setTimeout(() => {
       flushCloudSync();
     }, 5000);
-    const code = e && e.code ? ` (${e.code})` : '';
-    showToast(`☁️ クラウド保存に失敗しました${code}（自動で再試行します）`);
+
   } finally {
     cloudSyncInFlight = false;
     if (pendingSyncUpdatedAt > 0) {
